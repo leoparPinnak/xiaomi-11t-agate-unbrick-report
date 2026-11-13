@@ -5,7 +5,7 @@
 **Depolama & RAM:** 128 GB UFS (`SAMSUNG KLUDG4UHDC-B0E1` — `LU0: 4 MB`, `LU1: 4 MB`, `LU2: 128 GB`) + 4 GB / LPDDR4X DRAM (`0x40000000`)  
 **Güvenlik Kilidi (BROM):** `SecCFG: SBC + SLA + DAA` (`Target config: 0xe7`, `Mem read/write auth: True`, `Cmd 0xC8 blocked: True`)  
 **Tarih Aralığı:** 12 – 13 Kasım 2026  
-**Sonuç:** Tamamen ölü / siyah ekran (`Hard-Brick`, sadece BROM) durumundan ücretli yetkili hesap/box olmadan **ekranı ve sistemi geri açıldı**.
+**Sonuç:** Tamamen ölü / siyah ekran (`Hard-Brick`, sadece BROM) durumundan ücretli yetkili hesap/box olmadan **ekranı, Fastboot/fastbootd modu ve tam Android sistemi (MIUI `V13.0.2.0.SKWMIXM`) geri açıldı** (`Xiaomi 11T` masaüstüne sorunsuz boot etti).
 
 ---
 
@@ -122,7 +122,22 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 2. [`C:\mtk\extract_stock.py`](file:///C:/mtk/extract_stock.py) ile `C:\Users\met\Desktop\telefon-yedek\firmware\payload.bin` içinden **MIUI `V13.0.2.0.SKWMIXM` (Android 12)** imajları çıkarıldı (`audio_dsp`, `boot`, `cam_vpu1..3`, `dpm`, `dtbo`, `gz`, `lk`, `mcupm`, `md1img`, `mitee`, `pi_img`, `preloader_raw`, `scp`, `spmfw`, `sspm`, `system_ext`, `tee`, `vbmeta*`).
 3. Çıkarılan `preloader_raw.img` ve `lk.img` dosyalarının cihazın orijinal dump'larıyla (`MABT_1732` ve `rev\lk_a.img`) **baytı baytına eşleştiği** doğrulandı.
 4. `nvram`, `nvdata`, `nvcfg`, `protect1`, `protect2`, `persist`, `proinfo`, `seccfg`, `otp` ve `LU0` preloader'a **hiç dokunulmadan**, 21 adet orijinal Stok `V13.0.2.0` boot/firmware partisyonu + temizlenmiş `misc_clean.bin` (`boot-fastboot` kilidi kaldırılmış, `_a` slotu korunmuş) [`C:\mtk\run_stock_boot.ps1`](file:///C:/mtk/run_stock_boot.ps1) üzerinden `WinUSB` + `flash_eng_cached.py` ile ~45 saniyede yazıldı (`mtk_stock_live.log`, tümü %100 başarılı + `metadata`/`frp` format).
-5. Batarya sök-tak ve güç tuşuna basılmasının ardından **cihazın ekranı ve sistemi geri geldi (`"aha geldi"`).**
+5. Batarya sök-tak ve güç tuşuna basılmasının ardından **cihazın ekranı ve Fastboot modu geri geldi (`"aha geldi"`).**
+
+### Adım 5: `fastbootd` Üzerinden Tam Stok `super` Sisteminin Yazılması ve Masaüstüne Açılış (01:45 – 01:51)
+1. Bootloader Fastboot bağlantısı doğrulandı (`dm6dinskv8kjswqs fastboot`, `unlocked: yes`, `current-slot: a`, `anti: 2`, `USB\VID_18D1&PID_D00D` + Zadig `WinUSB`).
+2. `fastboot reboot fastboot` ile Android 12 stok `boot_a` içindeki userspace **`fastbootd`** moduna geçildi (`is-userspace: yes`, `super-partition-name: super`).
+3. Bir önceki ENG ROM denemesinden kalan dinamik partisyon tablosu `fastbootd` üzerinden yeniden boyutlandırıldı (tümü `OKAY`):
+   - `system_b → 0`, `odm_a → 0`
+   - `system_a → 2,887,729,152 B` (~2.69 GB)
+   - `vendor_a → 2,092,617,728 B` (~1.95 GB)
+   - `product_a → 1,739,563,008 B` (~1.62 GB)
+   - `system_ext_a → 692,473,856 B` (~660 MB)
+4. [`C:\mtk\run_fb_stock.ps1`](file:///C:/mtk/run_fb_stock.ps1) betiği ile toplam **7.4 GB** stok MIUI `V13.0.2.0.SKWMIXM` dinamik partisyonları **5.5 dakikada** (`01:45:39` – `01:51:07`) `fastbootd` üzerinden hatasız yazıldı:
+   - `system_a` (11/11 parça), `vendor_a` (8/8 parça), `product_a` (7/7 parça), `system_ext_a`
+   - *(Not: `product_a` yazımı sırasında `fastbootd` ekranı OLED koruma nedeniyle kendini kararttı; USB bağlantısı kesilmeden arka planda yazma tamamlandı.)*
+5. `fastboot erase userdata` + `fastboot erase metadata` + `fastboot reboot` (`01:51:07`) çalıştırıldı.
+6. **Sonuç:** Cihaz Android/MIUI masaüstüne sorunsuz açıldı (`"cihaz geldi"`), Windows tarafından **`Xiaomi 11T` (`USB\VID_2717&PID_FF40`, WPD/MTP)** olarak tanındı.
 
 ---
 
@@ -131,15 +146,17 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | Dosya / Araç | Görevi |
 |---|---|
 | `C:\Users\met\Desktop\telefon-yedek\partisyonlar\` | 11 kritik orijinal partisyonun SHA-256 doğrulamalı yedeği (dokunulmadı) |
-| `C:\Users\met\Desktop\zadig-2.9.exe` | `USB\VID_0E8D&PID_0003` üzerine HVCI uyumlu `WinUSB` sürücüsü kurdu |
+| `C:\Users\met\Desktop\zadig-2.9.exe` | `USB\VID_0E8D&PID_0003` ve `VID_18D1&PID_D00D` için HVCI uyumlu `WinUSB` kurdu |
 | `C:\mtk\flash_eng_cached.py` | `mtkclient` GPT/paket önbelleği + `Pipe error` `clear_halt` runtime yaması |
 | `C:\mtk\simg2img.py` | Android sparse imajları (`super.img`, `userdata.img`) RAW formata çevirdi |
 | `C:\mtk\extract_stock.py` | `payload.bin` (`CrAU`) içinden stok `V13.0.2.0.SKWMIXM` partisyonlarını çıkardı |
 | `C:\mtk\stock\` & `C:\mtk\run_stock_boot.ps1` | Stok `V13.0.2.0` boot/firmware partisyonlarını ~45 saniyede cihaza yazdı |
-| `C:\mtk\platform-tools\fastboot.exe` & `adb.exe` | Açılan cihazda Fastboot/ADB devam adımları için hazırlandı |
+| `C:\mtk\platform-tools\fastboot.exe` & `run_fb_stock.ps1` | `fastbootd` üzerinden 7.4 GB stok `super` sistemini 5.5 dakikada yazıp cihazı açtı |
 
 ---
 
-## 6. Kalan Son Adım (Sistemi Tam Açma)
+## 6. Durum Özeti
 
-Boot/firmware (`lk`, `boot`, `dtbo`, `tee`, `md1img`, vb.) stok `V13.0.2.0` ile tamamen kurtarılmış durumda. `super` bölümünde hâlâ bir önceki denemeden kalan ENG `super` bulunduğu için, açılan cihaz USB'ye bağlanıp Fastboot üzerinden stok `system.img`, `vendor.img`, `product.img` ve `system_ext.img` (veya `lpmake` ile paketlenmiş `super_stock.img`) yazıldığında telefon tamamen stok MIUI 13 masaüstüne açılacaktır.
+- **Hard-Brick Kurtarma:** Tamamlandı (ücretli yetkili hesap/box olmadan BROM → `WinUSB` + yamalı `mtkclient` → Stok `V13.0.2.0` → `fastbootd` → tam açılış).
+- **Veri & Kimlik Güvenliği:** `nvram`, `nvdata`, `nvcfg`, `protect1`, `protect2`, `persist`, `proinfo`, `seccfg`, `otp` ve `LU0` preloader'a hiç dokunulmadı; önceki sahte `amber` spoof kalıntısı yerine temiz `V13.0.2.0.SKWMIXM` sistemine geçildi.
+- **Sıradaki Doğrulama:** Telefon açıldığına göre `*#06#` ile IMEI ve SIM şebeke durumu kontrol edilip gerekirse IMEI adımına geçilebilir.
