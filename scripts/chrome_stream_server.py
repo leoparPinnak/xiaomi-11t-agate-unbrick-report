@@ -261,17 +261,6 @@ async def attach_to_tab(target_id=None):
         pass
 
     active_ws = await active_sess.ws_connect(chosen["webSocketDebuggerUrl"], max_msg_size=16 * 1024 * 1024)
-    await cdp_send("Page.enable")
-    await cdp_send("Emulation.setDeviceMetricsOverride", {
-        "width": 1920, "height": 1080, "deviceScaleFactor": 1, "mobile": False
-    })
-    await cdp_send("Page.startScreencast", {
-        "format": "jpeg",
-        "quality": stream_cfg["quality"],
-        "maxWidth": stream_cfg["maxWidth"],
-        "maxHeight": stream_cfg["maxHeight"],
-        "everyNthFrame": stream_cfg["everyNthFrame"],
-    })
 
     async def _read_loop(ws):
         global latest_frame, frame_seq
@@ -289,12 +278,39 @@ async def attach_to_tab(target_id=None):
                     frame_event.clear()
                     await broadcast_frame(raw)
                     await cdp_send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
+                elif data.get("id") == 900001 and "result" in data and "data" in data["result"]:
+                    raw = base64.b64decode(data["result"]["data"])
+                    latest_frame = raw
+                    frame_seq += 1
+                    frame_event.set()
+                    frame_event.clear()
+                    await broadcast_frame(raw)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            print("reader error:", e, flush=True)
 
     reader_task = asyncio.create_task(_read_loop(active_ws))
+    await cdp_send("Page.enable")
+    await cdp_send("Page.stopScreencast")
+    await cdp_send("Emulation.setDeviceMetricsOverride", {
+        "width": 1920, "height": 1080, "deviceScaleFactor": 1, "mobile": False
+    })
+    await cdp_send("Page.startScreencast", {
+        "format": "jpeg",
+        "quality": stream_cfg["quality"],
+        "maxWidth": stream_cfg["maxWidth"],
+        "maxHeight": stream_cfg["maxHeight"],
+        "everyNthFrame": stream_cfg["everyNthFrame"],
+    })
+    # Immediate snapshot so static pages show up instantly on tab switch
+    async with cdp_lock:
+        if active_ws and not active_ws.closed:
+            await active_ws.send_json({
+                "id": 900001,
+                "method": "Page.captureScreenshot",
+                "params": {"format": "jpeg", "quality": stream_cfg["quality"]},
+            })
     return True
 
 
