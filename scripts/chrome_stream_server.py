@@ -42,6 +42,14 @@ active_ws = None
 active_sess = None
 cmd_id = 0
 reader_task = None
+_bg_tasks = set()
+
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
 
 
 def _rfile(path, default=""):
@@ -232,7 +240,7 @@ def publish_frame(raw_bytes):
         if ws.closed:
             ws_clients.discard(ws)
         else:
-            asyncio.create_task(_send_one_ws(ws, raw_bytes))
+            _spawn(_send_one_ws(ws, raw_bytes))
 
 
 async def hwjpeg_socket_reader():
@@ -348,7 +356,7 @@ async def attach_to_tab(target_id=None):
         except Exception as e:
             print("reader error:", e, flush=True)
 
-    reader_task = asyncio.create_task(_read_loop(active_ws))
+    reader_task = _spawn(_read_loop(active_ws))
     await cdp_send("Page.enable")
     await cdp_send("Page.bringToFront")
     await apply_tab_stream_mode()
@@ -443,7 +451,7 @@ async def cdp_supervisor():
     global active_sess
     os.makedirs(USER_DIR, exist_ok=True)
     await launch_weston_hw()
-    asyncio.create_task(hwjpeg_socket_reader())
+    _spawn(hwjpeg_socket_reader())
 
     active_sess = aiohttp.ClientSession()
     pages = await fetch_pages()
@@ -1189,7 +1197,7 @@ async def handle_input(request):
 
 
 async def main():
-    asyncio.create_task(cdp_supervisor())
+    _spawn(cdp_supervisor())
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws/stream", ws_stream)

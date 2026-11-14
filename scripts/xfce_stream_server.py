@@ -19,6 +19,14 @@ frame_event = asyncio.Event()
 ws_clients = set()
 _prev_cpu = None
 _cached_cpu_pct = 0.0
+_bg_tasks = set()
+
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
 
 # --- X11 + XTest ctypes controller for DISPLAY=:0 ---
 _x11 = ctypes.CDLL("libX11.so.6")
@@ -165,7 +173,7 @@ def publish_frame(jpg):
         if ws.closed:
             ws_clients.discard(ws)
         else:
-            asyncio.create_task(_send_ws(ws, jpg))
+            _spawn(_send_ws(ws, jpg))
 
 
 async def xfce_socket_reader():
@@ -666,7 +674,7 @@ async def handle_input(request):
 
 
 async def main():
-    asyncio.create_task(xfce_socket_reader())
+    _spawn(xfce_socket_reader())
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws/stream", ws_stream)
