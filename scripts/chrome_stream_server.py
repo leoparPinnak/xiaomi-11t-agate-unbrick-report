@@ -23,10 +23,11 @@ frame_event = asyncio.Event()
 ws_clients = set()
 
 stream_cfg = {
-    "quality": 65,
+    "format": "jpeg",
+    "quality": 90,
     "everyNthFrame": 1,
-    "maxWidth": 1280,
-    "maxHeight": 720,
+    "maxWidth": 1920,
+    "maxHeight": 1080,
 }
 
 _prev_cpu = None
@@ -264,7 +265,7 @@ async def attach_to_tab(target_id=None):
     except Exception:
         pass
 
-    active_ws = await active_sess.ws_connect(chosen["webSocketDebuggerUrl"], max_msg_size=16 * 1024 * 1024)
+    active_ws = await active_sess.ws_connect(chosen["webSocketDebuggerUrl"], max_msg_size=64 * 1024 * 1024)
 
     async def _read_loop(ws):
         try:
@@ -289,30 +290,42 @@ async def attach_to_tab(target_id=None):
     await cdp_send("Page.bringToFront")
     await cdp_send("Page.stopScreencast")
     await cdp_send("Emulation.setDeviceMetricsOverride", {
-        "width": 1920, "height": 1080, "deviceScaleFactor": 1, "mobile": False
+        "width": stream_cfg["maxWidth"], "height": stream_cfg["maxHeight"], "deviceScaleFactor": 1, "mobile": False
     })
-    await cdp_send("Page.startScreencast", {
-        "format": "jpeg",
-        "quality": stream_cfg["quality"],
+    sc_params = {
+        "format": stream_cfg["format"],
         "maxWidth": stream_cfg["maxWidth"],
         "maxHeight": stream_cfg["maxHeight"],
         "everyNthFrame": stream_cfg["everyNthFrame"],
-    })
-    await cdp_send("Page.captureScreenshot", {
-        "format": "jpeg", "quality": stream_cfg["quality"]
-    }, fixed_id=900001)
+    }
+    if stream_cfg["format"] == "jpeg":
+        sc_params["quality"] = stream_cfg["quality"]
+    await cdp_send("Page.startScreencast", sc_params)
+    shot_params = {"format": stream_cfg["format"]}
+    if stream_cfg["format"] == "jpeg":
+        shot_params["quality"] = stream_cfg["quality"]
+    await cdp_send("Page.captureScreenshot", shot_params, fixed_id=900001)
     return True
 
 
 async def restart_screencast():
     await cdp_send("Page.stopScreencast")
-    await cdp_send("Page.startScreencast", {
-        "format": "jpeg",
-        "quality": stream_cfg["quality"],
+    await cdp_send("Emulation.setDeviceMetricsOverride", {
+        "width": stream_cfg["maxWidth"], "height": stream_cfg["maxHeight"], "deviceScaleFactor": 1, "mobile": False
+    })
+    sc_params = {
+        "format": stream_cfg["format"],
         "maxWidth": stream_cfg["maxWidth"],
         "maxHeight": stream_cfg["maxHeight"],
         "everyNthFrame": stream_cfg["everyNthFrame"],
-    })
+    }
+    if stream_cfg["format"] == "jpeg":
+        sc_params["quality"] = stream_cfg["quality"]
+    await cdp_send("Page.startScreencast", sc_params)
+    shot_params = {"format": stream_cfg["format"]}
+    if stream_cfg["format"] == "jpeg":
+        shot_params["quality"] = stream_cfg["quality"]
+    await cdp_send("Page.captureScreenshot", shot_params, fixed_id=900001)
 
 
 async def launch_chromium_clean():
@@ -413,9 +426,10 @@ async def cdp_supervisor():
             await attach_to_tab()
         elif time.monotonic() - last_frame_ts > 1.2 and ws_clients:
             try:
-                await cdp_send("Page.captureScreenshot", {
-                    "format": "jpeg", "quality": stream_cfg["quality"]
-                }, fixed_id=900001)
+                shot_params = {"format": stream_cfg["format"]}
+                if stream_cfg["format"] == "jpeg":
+                    shot_params["quality"] = stream_cfg["quality"]
+                await cdp_send("Page.captureScreenshot", shot_params, fixed_id=900001)
             except Exception:
                 pass
 
@@ -635,16 +649,23 @@ HTML = r"""<!doctype html>
       <input id="url" placeholder="URL veya Google araması yaz..." onkeydown="if(event.key==='Enter')nav()">
       <button class="go-btn" onclick="nav()">Git</button>
     </div>
-    <select class="ctrl-select" id="sel-nth" onchange="applyStreamCfg()" title="Kare Yakalama Sıklığı">
-      <option value="1" selected>Akış: 1x (Akıcı)</option>
-      <option value="2">Akış: 2x (Hızlı)</option>
-      <option value="3">Akış: 3x (Dengeli)</option>
-      <option value="5">Akış: 5x (Hafif)</option>
+    <select class="ctrl-select" id="sel-res" onchange="applyStreamCfg()" title="Çözünürlük">
+      <option value="1280x720">720p HD</option>
+      <option value="1920x1080" selected>1080p Full HD</option>
+      <option value="2560x1440">1440p 2K QHD</option>
+      <option value="3840x2160">2160p 4K UHD</option>
     </select>
-    <select class="ctrl-select" id="sel-qual" onchange="applyStreamCfg()" title="JPEG Kalitesi">
-      <option value="50">Kalite %50</option>
-      <option value="65" selected>Kalite %65</option>
-      <option value="85">Kalite %85</option>
+    <select class="ctrl-select" id="sel-qual" onchange="applyStreamCfg()" title="Görüntü Kalitesi / Formatı">
+      <option value="jpeg:65">Hızlı (%65 JPEG)</option>
+      <option value="jpeg:90" selected>Yüksek (%90 JPEG)</option>
+      <option value="jpeg:100">Ultra (%100 JPEG)</option>
+      <option value="png:100">Native (Kayıpsız PNG)</option>
+    </select>
+    <select class="ctrl-select" id="sel-nth" onchange="applyStreamCfg()" title="Kare Yakalama Sıklığı">
+      <option value="1" selected>Akış: 1x</option>
+      <option value="2">Akış: 2x</option>
+      <option value="3">Akış: 3x</option>
+      <option value="5">Akış: 5x</option>
     </select>
     <button class="nav-btn" onclick="pasteClip()" title="Panoyu Yapıştır">📋</button>
     <button class="nav-btn" onclick="toggleFs()" title="Tam Ekran">⛶</button>
@@ -716,6 +737,9 @@ let bytesThisSec = 0;
 let lastBlobUrl = null;
 let lastMoveTs = 0;
 let wsConnected = false;
+let curW = 1920;
+let curH = 1080;
+let curFmtLabel = 'JPEG q=90';
 
 urlInput.addEventListener('focus', () => currentUrlFocused = true);
 urlInput.addEventListener('blur', () => currentUrlFocused = false);
@@ -748,7 +772,7 @@ setInterval(() => {
   document.getElementById('pill-fps').textContent = `FPS: ${fps}`;
   document.getElementById('pill-bw').textContent = `${kbps} KB/s`;
   document.getElementById('t-stream').textContent = `${fps} FPS · ${kbps} KB/s`;
-  document.getElementById('hud-overlay').textContent = `1920×1080 → ${fps} FPS · ${kbps} KB/s`;
+  document.getElementById('hud-overlay').textContent = `${curW}×${curH} (${curFmtLabel}) · ${fps} FPS · ${kbps} KB/s`;
 }, 1000);
 
 async function sendCtrl(payload) {
@@ -864,7 +888,16 @@ async function refreshTelemetry() {
     document.getElementById('t-susp').textContent = t.input_suspend ? 'Şarj Kesildi (70%)' : 'Şarj Açık';
     document.getElementById('t-pwr').textContent = `${t.watts} W · ${t.ma} mA · ${t.volts} V`;
 
-    document.getElementById('t-res').textContent = `${t.stream_cfg.maxWidth}×${t.stream_cfg.maxHeight} JPEG · q=${t.stream_cfg.quality} · ${t.stream_cfg.everyNthFrame}x`;
+    curW = t.stream_cfg.maxWidth;
+    curH = t.stream_cfg.maxHeight;
+    curFmtLabel = t.stream_cfg.format === 'png' ? 'NATIVE PNG' : `JPEG q=${t.stream_cfg.quality}`;
+    document.getElementById('t-res').textContent = `${curW}×${curH} ${curFmtLabel} · ${t.stream_cfg.everyNthFrame}x`;
+    const rSel = document.getElementById('sel-res');
+    if (document.activeElement !== rSel) rSel.value = `${curW}x${curH}`;
+    const qSel = document.getElementById('sel-qual');
+    if (document.activeElement !== qSel) qSel.value = t.stream_cfg.format === 'png' ? 'png:100' : `jpeg:${t.stream_cfg.quality}`;
+    const nSel = document.getElementById('sel-nth');
+    if (document.activeElement !== nSel) nSel.value = String(t.stream_cfg.everyNthFrame);
   } catch (e) {}
 }
 setInterval(refreshTelemetry, 1200);
@@ -880,11 +913,16 @@ async function toggleGpuPerf() {
 }
 
 async function applyStreamCfg() {
-  const quality = parseInt(document.getElementById('sel-qual').value, 10);
+  const [wStr, hStr] = document.getElementById('sel-res').value.split('x');
+  const [fmt, qStr] = document.getElementById('sel-qual').value.split(':');
   const everyNthFrame = parseInt(document.getElementById('sel-nth').value, 10);
+  curW = parseInt(wStr, 10);
+  curH = parseInt(hStr, 10);
+  const quality = parseInt(qStr, 10);
+  curFmtLabel = fmt === 'png' ? 'NATIVE PNG' : `JPEG q=${quality}`;
   await fetch('/api/stream_cfg', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({quality, everyNthFrame})
+    body: JSON.stringify({maxWidth: curW, maxHeight: curH, format: fmt, quality, everyNthFrame})
   });
 }
 
@@ -907,8 +945,8 @@ function toggleFs() {
 function coords(e) {
   const r = scr.getBoundingClientRect();
   return {
-    x: Math.max(0, Math.min(1919, Math.round((e.clientX - r.left) * 1920 / r.width))),
-    y: Math.max(0, Math.min(1079, Math.round((e.clientY - r.top) * 1080 / r.height)))
+    x: Math.max(0, Math.min(curW - 1, Math.round((e.clientX - r.left) * curW / r.width))),
+    y: Math.max(0, Math.min(curH - 1, Math.round((e.clientY - r.top) * curH / r.height)))
   };
 }
 scr.addEventListener('contextmenu', e => e.preventDefault());
@@ -967,7 +1005,8 @@ async def ws_stream(request):
 async def frame_jpg(request):
     if not latest_frame:
         return web.Response(status=503, text="Waiting for first frame")
-    return web.Response(body=latest_frame, content_type="image/jpeg")
+    ct = "image/png" if latest_frame.startswith(b"\x89PNG") else "image/jpeg"
+    return web.Response(body=latest_frame, content_type=ct)
 
 
 async def stream_mjpg(request):
@@ -1051,10 +1090,15 @@ async def api_gpu_perf(request):
 
 async def api_stream_cfg(request):
     body = await request.json()
+    if body.get("format") in ("jpeg", "png"):
+        stream_cfg["format"] = body["format"]
     if "quality" in body:
-        stream_cfg["quality"] = max(20, min(95, int(body["quality"])))
+        stream_cfg["quality"] = max(20, min(100, int(body["quality"])))
     if "everyNthFrame" in body:
         stream_cfg["everyNthFrame"] = max(1, min(10, int(body["everyNthFrame"])))
+    if "maxWidth" in body and "maxHeight" in body:
+        stream_cfg["maxWidth"] = max(640, min(3840, int(body["maxWidth"])))
+        stream_cfg["maxHeight"] = max(480, min(2160, int(body["maxHeight"])))
     await restart_screencast()
     return web.json_response({"ok": True, "stream_cfg": stream_cfg})
 
