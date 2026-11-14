@@ -237,6 +237,18 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - WebGL 2.0 `UNMASKED_RENDERER_WEBGL`: **`ANGLE (ARM, Mali-G77 MC9, OpenGL ES 3.2)`**
    - `/dev/mali0`, `/dev/ion`, `/dev/video*`, `/dev/dri/card0` izinleri `0666` olarak `/sbin/linux_init` içine sabitlendi.
 
+### Adım 15: Çift Donanım JPEG Kodlayıcı (`/dev/video3` & `/dev/video4`), `/dev/video2` Tespiti ve Şarj Eşiği Güncellemesi
+1. **Çift Donanım JPEG Motorunun Açılması (`scripts/hwjpeg_v4l2.c` → `/usr/local/lib/libhwjpeg.so`):**
+   - `mtk-jpeg-enc` (`/dev/video3` ve `/dev/video4`) düğümlerinin `V4L2_MEMORY_MMAP` bellek ayırmasında `vb2_dc_alloc` hatası verdiği, `V4L2_MEMORY_DMABUF` (`mem=4`) beklediği tespit edildi.
+   - `/dev/ion` üzerinde System heap (`0x1`) parçalama hatası (`contiguous chunk is too small`) verirken, MediaTek Multimedia IOMMU heap'i **`heap_id_mask = 0x400`** ile alınan DMA-BUF'ların her iki motorla da kusursuz çalıştığı doğrulandı.
+   - **Ölçülen Hız (`1280×720`):**
+     - `YUYV → HW JPEG`: `/dev/video3` **141.5 FPS (`7.07 ms/kare`)** + `/dev/video4` **140.0 FPS (`7.14 ms/kare`)** (toplam **~281 FPS** donanım JPEG).
+     - Python `ctypes` üzerinden `RGBA → HW JPEG` (`libhwjpeg.so`): **117.5 FPS (`8.51 ms/kare`)** (`PIL.Image.verify()` doğrulamalı geçerli JFIF JPEG).
+2. **H.264 VENC (`/dev/video2`) Bulgusu:**
+   - `/dev/video2` (`17020000.venc`) `encoder capability 0` döndü (kullanıcı alanı `/vendor/bin/vpud` VCU servisine bağlı). Çift donanım JPEG motoru (`/dev/video3` + `/dev/video4`) doğrudan çalıştığı için ek VCU daemonu gerektirmeden 10 Chrome akışı için yeterlidir.
+3. **Şarj Eşiği Histerezisi Güncellemesi (`scripts/charge-limit.sh`):**
+   - Önceki `%60` alt eşiği yüzünden pil `%62–%64` aralığındayken `input_suspend = 1` kalarak şarj başlamıyordu; alt eşik **`<= %67`** (üst eşik **`>= %70`**) olarak güncellendi ve `input_suspend = 0` sıfırlandı.
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -256,9 +268,10 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `C:\mtk\v125\brom_unlock_lk13.py` | `oem_misc1` temizliği + imzalı `V13.0.2.0 lk.img` ile kilidi BROM'dan açtı |
 | `scripts/setup_ubuntu.sh` | Android üzerinde 32 GB sparse `ext4` loop imajına Ubuntu 22.04 kurulumu |
 | `scripts/build_native_boot.py` | Stok `kernel` + `dtb` + statik `busybox` `initramfs` ile Android'siz `boot.img` üreticisi |
-| `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı (RNDIS + MTK Wi-Fi + SSH + ekran karartma + %60–%70 şarj kesici) |
+| `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı + `%67–%70` şarj kesici |
 | `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `pyte`/`tmux` terminal + Güç tuşu ekran aç/kapa |
 | `scripts/libhybris_mali_agate.patch` | `libhybris` Mali-G77 MC9 (`Android 11` / `MT6893` `/dev/ion` & ANGLE) tam yaması |
+| `scripts/hwjpeg_v4l2.c` | `/dev/video3` & `/dev/video4` ION `0x400` V4L2 DMABUF donanım JPEG kütüphanesi (`/usr/local/lib/libhwjpeg.so`) |
 | `scripts/chrome-gpu.sh` & `scripts/chrome_stream_server.py` | Mali-G77 GPU hızlandırmalı Chromium 156 başlatıcısı ve `:8080` canlı akış sunucusu |
 | `scripts/geri_donus_v1259_fastboot.ps1` & `geri_donus_v1302_fastboot.ps1` | Bootloader kilitlemeden Android 11 / Android 12 geri dönüş betikleri |
 
@@ -267,7 +280,7 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 ## 6. Durum Özeti
 
 - **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
-- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — `super` boş alanındaki 2.2 GB `ext4` bölümünden açılıyor; **USB RNDIS (`192.168.77.1:2222`)**, **Wi-Fi (`192.168.2.212:2222`)**, **%60–%70 şarj kesici**, **telemetrili `/dev/fb0` ekran arayüzü** (`Güç` tuşuyla aç/kapa, otomatik SSH `tmux` aynalama) ve **Mali-G77 MC9 GPU hızlandırmalı ARM64 Chromium 156** aktif.
+- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — **USB RNDIS**, **Wi-Fi (`192.168.2.212:2222`)**, **`%67–%70` şarj kesici**, **`/dev/fb0` telemetri dashboard'u**, **Mali-G77 MC9 GPU hızlandırmalı Chromium 156** ve **çift donanım JPEG kodlayıcı (`libhwjpeg.so`, ~280 FPS 720p)** aktif.
 - **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır.
 
 ---
@@ -276,15 +289,11 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 
 ### A. Çözülenler & Aktif Donanım Düğümleri
 - **GPU ÇÖZÜLDÜ:** **`Mali-G77 MC9`** (`/dev/mali0` + `libhybris` `/usr/local/hybris/lib`) **OpenCL 2.1**, **OpenGL ES 3.2** ve **Chromium 156 WebGL 2.0 (`ANGLE (ARM, Mali-G77 MC9, OpenGL ES 3.2)`)** ile tam çalışır durumda.
-- **Sıradaki Donanım Video & JPEG Kodlayıcı Düğümleri (Hazır, Test Bekliyor):**
-  - **`/dev/video3`** & **`/dev/video4`**: Çift donanım `mtk-jpeg-enc` (`NM12`, `NM21`, `YUYV`, `YVYU` → `JPEG`)
-  - **`/dev/video2`**: `mtk-vcodec-enc` (H.264/HEVC V4L2 encoder, `/dev/vcu`)
-  - **`/dev/mtk_mdp`**: Donanım renk/ölçekleme motoru
+- **DONANIM JPEG ÇÖZÜLDÜ:** **`/dev/video3`** & **`/dev/video4`** (`mtk-jpeg-enc` + `/dev/ion` `0x400`) tek başına motor başı `~141 FPS`, `libhwjpeg.so` üzerinden Python ile `117.5 FPS` `RGBA → JPEG` veriyor.
+- **VCU / H.264 Notu:** `/dev/video2` (`mtk-vcodec-enc`) `/vendor/bin/vpud` VCU servisi olmadan yetenek bildirmiyor (`encoder capability 0`).
 
 ### B. Sıradaki Somut Plan
-1. **Donanım JPEG & Video Encode (`/dev/video3`, `/dev/video4`, `/dev/video2`):**
-   - `mtk-jpeg-enc` (`/dev/video3`, `/dev/video4`) ve `mtk-vcodec-enc` (`/dev/video2`) düğümlerini V4L2 M2M üzerinden test edip kare encode'u CPU'dan donanım motoruna almak.
-2. **10 Eşzamanlı Chrome Penceresi Mimarisi:**
-   - 10 ayrı Chromium prosesi yerine tek Mali-G77 GPU'lu Chromium prosesinde 10 izole `BrowserContext` (`Target.createTarget`) + `zram` swap + donanım encode (`video3`/`video4`/`video2`).
-3. **Ses Akışı (Gerektiğinde):** `PulseAudio` `module-null-sink` üzerinden WebSocket/Opus ses aktarımı.
-4. **Depolama Genişletme & Özel Kernel (Opsiyonel):** `userdata` (`106 GB`) bölümünü ext4 Ubuntu diski yapmak ve gerekirse `CONFIG_USER_NS`/`SYSVIPC`/`DEVTMPFS` açık özel kernel derlemek.
+1. **10 Eşzamanlı Chrome Penceresi + `libhwjpeg.so` Akışı:**
+   - Tek Mali-G77 GPU'lu Chromium prosesinde 10 izole `BrowserContext` (`Target.createTarget`) + `zram` swap (`4 GB`) + `/dev/video3`/`/dev/video4` donanım JPEG havuzu bağlamak.
+2. **Ses Akışı (Gerektiğinde):** `PulseAudio` `module-null-sink` üzerinden WebSocket/Opus ses aktarımı.
+3. **Depolama Genişletme & Özel Kernel (Opsiyonel):** `userdata` (`106 GB`) bölümünü ext4 Ubuntu diski yapmak ve gerekirse `CONFIG_USER_NS`/`SYSVIPC`/`DEVTMPFS` açık özel kernel derlemek.
