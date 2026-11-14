@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import re
+import struct
 import subprocess
 import time
 from urllib.parse import quote
@@ -15,6 +16,7 @@ CDP_PORT = 9222
 HTTP_PORT = 8080
 USER_DIR = "/tmp/chrome_profile"
 XDG_DIR = "/tmp/xdg_chrome_rt"
+HWJPEG_SOCK = "/tmp/weston_hwjpeg.sock"
 
 active_target_id = None
 latest_frame = None
@@ -22,7 +24,9 @@ last_frame_ts = 0.0
 frame_event = asyncio.Event()
 ws_clients = set()
 
+# Default mode: hardware JPEG (/dev/video3 via weston_hwjpeg.so) at 1920x1080
 stream_cfg = {
+    "engine": "hwjpeg",     # "hwjpeg" (hardware /dev/video3) | "cdp" (Native PNG / 2K / 4K)
     "format": "jpeg",
     "quality": 90,
     "everyNthFrame": 1,
@@ -208,7 +212,7 @@ async def fetch_pages():
 
 async def _send_one_ws(ws, raw_bytes):
     try:
-        await asyncio.wait_for(ws.send_bytes(raw_bytes), timeout=0.4)
+        await asyncio.wait_for(ws.send_bytes(raw_bytes), timeout=0.35)
     except Exception:
         ws_clients.discard(ws)
 
@@ -224,6 +228,59 @@ def publish_frame(raw_bytes):
             ws_clients.discard(ws)
         else:
             asyncio.create_task(_send_one_ws(ws, raw_bytes))
+
+
+async def hwjpeg_socket_reader():
+    """Reads zero-CPU hardware-encoded JPEG frames directly from Weston (/dev/video3)."""
+    while True:
+        try:
+            if not os.path.exists(HWJPEG_SOCK):
+                await asyncio.sleep(0.3)
+                continue
+            reader, writer = await asyncio.open_unix_connection(HWJPEG_SOCK, limit=16 * 1024 * 1024)
+            try:
+                while True:
+                    hdr = await reader.readexactly(4)
+                    sz = struct.unpack("<I", hdr)[0]
+                    if sz <= 0 or sz > 16 * 1024 * 1024:
+                        break
+                    jpg = await reader.readexactly(sz)
+                    if stream_cfg["engine"] == "hwjpeg":
+                        publish_frame(jpg)
+            finally:
+                writer.close()
+        except Exception:
+            await asyncio.sleep(0.4)
+
+
+async def apply_tab_stream_mode():
+    if stream_cfg["engine"] == "hwjpeg":
+        await cdp_send("Page.stopScreencast")
+        await cdp_send("Emulation.clearDeviceMetricsOverride")
+        # Trigger tiny repaint so weston_hwjpeg emits fresh frame immediately if static
+        if os.path.exists("/dev/shm/weston_hw.jpg"):
+            try:
+                publish_frame(open("/dev/shm/weston_hw.jpg", "rb").read())
+            except Exception:
+                pass
+    else:
+        await cdp_send("Page.stopScreencast")
+        await cdp_send("Emulation.setDeviceMetricsOverride", {
+            "width": stream_cfg["maxWidth"], "height": stream_cfg["maxHeight"], "deviceScaleFactor": 1, "mobile": False
+        })
+        sc_params = {
+            "format": stream_cfg["format"],
+            "maxWidth": stream_cfg["maxWidth"],
+            "maxHeight": stream_cfg["maxHeight"],
+            "everyNthFrame": stream_cfg["everyNthFrame"],
+        }
+        if stream_cfg["format"] == "jpeg":
+            sc_params["quality"] = stream_cfg["quality"]
+        await cdp_send("Page.startScreencast", sc_params)
+        shot_params = {"format": stream_cfg["format"]}
+        if stream_cfg["format"] == "jpeg":
+            shot_params["quality"] = stream_cfg["quality"]
+        await cdp_send("Page.captureScreenshot", shot_params, fixed_id=900001)
 
 
 async def attach_to_tab(target_id=None):
@@ -275,11 +332,12 @@ async def attach_to_tab(target_id=None):
                 data = json.loads(msg.data)
                 if data.get("method") == "Page.screencastFrame":
                     params = data["params"]
-                    # Ack first so Chromium never stalls waiting on our network writes
                     await cdp_send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
-                    publish_frame(base64.b64decode(params["data"]))
+                    if stream_cfg["engine"] == "cdp":
+                        publish_frame(base64.b64decode(params["data"]))
                 elif data.get("id") == 900001 and "result" in data and "data" in data["result"]:
-                    publish_frame(base64.b64decode(data["result"]["data"]))
+                    if stream_cfg["engine"] == "cdp":
+                        publish_frame(base64.b64decode(data["result"]["data"]))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -288,44 +346,42 @@ async def attach_to_tab(target_id=None):
     reader_task = asyncio.create_task(_read_loop(active_ws))
     await cdp_send("Page.enable")
     await cdp_send("Page.bringToFront")
-    await cdp_send("Page.stopScreencast")
-    await cdp_send("Emulation.setDeviceMetricsOverride", {
-        "width": stream_cfg["maxWidth"], "height": stream_cfg["maxHeight"], "deviceScaleFactor": 1, "mobile": False
-    })
-    sc_params = {
-        "format": stream_cfg["format"],
-        "maxWidth": stream_cfg["maxWidth"],
-        "maxHeight": stream_cfg["maxHeight"],
-        "everyNthFrame": stream_cfg["everyNthFrame"],
-    }
-    if stream_cfg["format"] == "jpeg":
-        sc_params["quality"] = stream_cfg["quality"]
-    await cdp_send("Page.startScreencast", sc_params)
-    shot_params = {"format": stream_cfg["format"]}
-    if stream_cfg["format"] == "jpeg":
-        shot_params["quality"] = stream_cfg["quality"]
-    await cdp_send("Page.captureScreenshot", shot_params, fixed_id=900001)
+    await apply_tab_stream_mode()
     return True
 
 
-async def restart_screencast():
-    await cdp_send("Page.stopScreencast")
-    await cdp_send("Emulation.setDeviceMetricsOverride", {
-        "width": stream_cfg["maxWidth"], "height": stream_cfg["maxHeight"], "deviceScaleFactor": 1, "mobile": False
-    })
-    sc_params = {
-        "format": stream_cfg["format"],
-        "maxWidth": stream_cfg["maxWidth"],
-        "maxHeight": stream_cfg["maxHeight"],
-        "everyNthFrame": stream_cfg["everyNthFrame"],
+async def launch_weston_hw():
+    os.makedirs(XDG_DIR, mode=0o700, exist_ok=True)
+    os.chmod(XDG_DIR, 0o700)
+    if os.path.exists(os.path.join(XDG_DIR, "wayland-1")) and os.path.exists(HWJPEG_SOCK):
+        return
+    subprocess.run(["pkill", "-f", "weston --backend=headless"], stderr=subprocess.DEVNULL)
+    await asyncio.sleep(0.3)
+    env = {
+        **os.environ,
+        "XDG_RUNTIME_DIR": XDG_DIR,
+        "HWJPEG_SOCK": HWJPEG_SOCK,
+        "HWJPEG_FLIP_Y": "0",
     }
-    if stream_cfg["format"] == "jpeg":
-        sc_params["quality"] = stream_cfg["quality"]
-    await cdp_send("Page.startScreencast", sc_params)
-    shot_params = {"format": stream_cfg["format"]}
-    if stream_cfg["format"] == "jpeg":
-        shot_params["quality"] = stream_cfg["quality"]
-    await cdp_send("Page.captureScreenshot", shot_params, fixed_id=900001)
+    subprocess.Popen(
+        [
+            "/usr/bin/weston",
+            "--backend=headless-backend.so",
+            "--use-pixman",
+            "--shell=kiosk-shell.so",
+            "--modules=/usr/local/lib/weston_hwjpeg.so",
+            "--socket=wayland-1",
+            "--width=1920",
+            "--height=1080",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    for _ in range(40):
+        if os.path.exists(os.path.join(XDG_DIR, "wayland-1")) and os.path.exists(HWJPEG_SOCK):
+            break
+        await asyncio.sleep(0.1)
 
 
 async def launch_chromium_clean():
@@ -344,10 +400,12 @@ async def launch_chromium_clean():
         "LIBGLESV2": "/mnt/avendor/lib64/egl/libGLES_mali.so",
         "DBUS_SESSION_BUS_ADDRESS": "disabled:",
     }
+    # Background tab throttling is KEPT ENABLED so opening 10+ tabs never steals FPS from active tab!
     subprocess.Popen(
         [
             "/usr/bin/chromium",
             "--no-sandbox",
+            "--test-type",
             "--disable-dev-shm-usage",
             "--ozone-platform=wayland",
             "--use-gl=angle",
@@ -358,11 +416,9 @@ async def launch_chromium_clean():
             "--enable-gpu-rasterization",
             "--enable-webgl",
             "--disable-blink-features=AutomationControlled",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
             "--no-first-run",
             "--no-default-browser-check",
+            "--hide-crash-restore-bubble",
             "--disable-infobars",
             "--password-store=basic",
             "--use-mock-keychain",
@@ -370,7 +426,7 @@ async def launch_chromium_clean():
             "--remote-allow-origins=*",
             "--window-size=1920,1080",
             f"--user-data-dir={USER_DIR}",
-            "https://www.google.com/",
+            "https://webglsamples.org/aquarium/aquarium.html",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -381,27 +437,8 @@ async def launch_chromium_clean():
 async def cdp_supervisor():
     global active_sess
     os.makedirs(USER_DIR, exist_ok=True)
-    os.makedirs(XDG_DIR, mode=0o700, exist_ok=True)
-    os.chmod(XDG_DIR, 0o700)
-
-    weston_env = {**os.environ, "XDG_RUNTIME_DIR": XDG_DIR}
-    if not os.path.exists(os.path.join(XDG_DIR, "wayland-1")):
-        subprocess.Popen(
-            [
-                "/usr/bin/weston",
-                "--backend=headless-backend.so",
-                "--socket=wayland-1",
-                "--width=1920",
-                "--height=1080",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=weston_env,
-        )
-        for _ in range(30):
-            if os.path.exists(os.path.join(XDG_DIR, "wayland-1")):
-                break
-            await asyncio.sleep(0.1)
+    await launch_weston_hw()
+    asyncio.create_task(hwjpeg_socket_reader())
 
     active_sess = aiohttp.ClientSession()
     pages = await fetch_pages()
@@ -415,16 +452,16 @@ async def cdp_supervisor():
 
     await attach_to_tab()
 
-    # Keepalive + fallback frame pump if static page hasn't repainted
     while True:
         await asyncio.sleep(1.0)
         if active_ws is None or active_ws.closed:
             pages = await fetch_pages()
             if not pages:
+                await launch_weston_hw()
                 await launch_chromium_clean()
                 await asyncio.sleep(2.0)
             await attach_to_tab()
-        elif time.monotonic() - last_frame_ts > 1.2 and ws_clients:
+        elif stream_cfg["engine"] == "cdp" and time.monotonic() - last_frame_ts > 1.2 and ws_clients:
             try:
                 shot_params = {"format": stream_cfg["format"]}
                 if stream_cfg["format"] == "jpeg":
@@ -439,7 +476,7 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Xiaomi 11T · Mali-G77 Cloud Browser Console</title>
+<title>Xiaomi 11T · Mali-G77 & HW-JPEG Console</title>
 <style>
   :root {
     --bg: #080b10;
@@ -461,13 +498,10 @@ HTML = r"""<!doctype html>
   }
   .app { display: flex; flex-direction: column; height: 100vh; width: 100vw; }
 
-  /* Tab Bar */
   .tabbar {
     display: flex; align-items: center; gap: 6px;
     padding: 6px 10px 0 10px;
-    background: #06090d;
-    border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
+    background: #06090d; border-bottom: 1px solid var(--border); flex-shrink: 0;
   }
   .brand {
     display: flex; align-items: center; gap: 6px; padding: 4px 8px 6px 2px;
@@ -488,8 +522,7 @@ HTML = r"""<!doctype html>
     max-width: 210px; min-width: 100px;
     padding: 6px 9px; border-radius: 8px 8px 0 0;
     background: var(--surface); border: 1px solid transparent; border-bottom: none;
-    color: var(--muted); font-size: 12px; cursor: pointer; user-select: none;
-    flex-shrink: 0;
+    color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; flex-shrink: 0;
   }
   .tab:hover { background: var(--surface2); color: var(--text); }
   .tab.active {
@@ -518,10 +551,10 @@ HTML = r"""<!doctype html>
     white-space: nowrap;
   }
   .pill.fps { color: var(--accent); border-color: rgba(0,229,153,.35); }
+  .pill.hw { color: #86efac; border-color: rgba(34,197,94,.4); }
   .pill.gpu-max { color: #fde047; border-color: rgba(250,204,21,.45); cursor: pointer; }
   .pill.gpu-auto { color: var(--accent2); border-color: rgba(56,189,248,.4); cursor: pointer; }
 
-  /* Toolbar */
   .toolbar {
     display: flex; align-items: center; gap: 6px;
     padding: 6px 10px; background: var(--surface2);
@@ -553,7 +586,6 @@ HTML = r"""<!doctype html>
     color: var(--text); font-size: 11.5px; cursor: pointer;
   }
 
-  /* Bookmarks */
   .bookmarks {
     display: flex; align-items: center; gap: 6px; padding: 4px 10px;
     background: var(--surface); border-bottom: 1px solid var(--border);
@@ -566,7 +598,6 @@ HTML = r"""<!doctype html>
   }
   .bm:hover { color: var(--text); border-color: var(--accent2); }
 
-  /* Browser Viewport - strictly bounded so telemetry dock NEVER clips */
   .stage {
     flex: 1 1 0; min-height: 0; width: 100%; overflow: hidden;
     display: flex; align-items: center; justify-content: center;
@@ -593,7 +624,6 @@ HTML = r"""<!doctype html>
     color: var(--accent); pointer-events: none;
   }
 
-  /* Bottom Telemetry Dock - fixed compact height, always visible */
   .telemetry {
     background: #070a0f; border-top: 1px solid var(--border);
     padding: 7px 10px;
@@ -635,6 +665,7 @@ HTML = r"""<!doctype html>
     <div class="tabs-wrap" id="tabs"></div>
     <button class="new-tab-btn" onclick="newTab()" title="Yeni Sekme">+</button>
     <div class="stream-pills">
+      <span class="pill hw" id="pill-eng">ENC: HW /dev/video3</span>
       <span class="pill fps" id="pill-fps">FPS: --</span>
       <span class="pill" id="pill-bw">-- KB/s</span>
       <span class="pill gpu-auto" id="pill-perf" onclick="toggleGpuPerf()" title="GPU/CPU Max Performans Modunu Aç/Kapat">GPU: --</span>
@@ -649,23 +680,11 @@ HTML = r"""<!doctype html>
       <input id="url" placeholder="URL veya Google araması yaz..." onkeydown="if(event.key==='Enter')nav()">
       <button class="go-btn" onclick="nav()">Git</button>
     </div>
-    <select class="ctrl-select" id="sel-res" onchange="applyStreamCfg()" title="Çözünürlük">
-      <option value="1280x720">720p HD</option>
-      <option value="1920x1080" selected>1080p Full HD</option>
-      <option value="2560x1440">1440p 2K QHD</option>
-      <option value="3840x2160">2160p 4K UHD</option>
-    </select>
-    <select class="ctrl-select" id="sel-qual" onchange="applyStreamCfg()" title="Görüntü Kalitesi / Formatı">
-      <option value="jpeg:65">Hızlı (%65 JPEG)</option>
-      <option value="jpeg:90" selected>Yüksek (%90 JPEG)</option>
-      <option value="jpeg:100">Ultra (%100 JPEG)</option>
-      <option value="png:100">Native (Kayıpsız PNG)</option>
-    </select>
-    <select class="ctrl-select" id="sel-nth" onchange="applyStreamCfg()" title="Kare Yakalama Sıklığı">
-      <option value="1" selected>Akış: 1x</option>
-      <option value="2">Akış: 2x</option>
-      <option value="3">Akış: 3x</option>
-      <option value="5">Akış: 5x</option>
+    <select class="ctrl-select" id="sel-mode" onchange="applyStreamCfg()" title="Encode Motoru & Kalite">
+      <option value="hwjpeg:1920x1080:jpeg:90" selected>HW-JPEG 1080p (/dev/video3)</option>
+      <option value="cdp:1920x1080:png:100">Native 1080p (Kayıpsız PNG)</option>
+      <option value="cdp:2560x1440:jpeg:95">2K QHD 1440p (CDP)</option>
+      <option value="cdp:3840x2160:png:100">4K UHD 2160p (Kayıpsız PNG)</option>
     </select>
     <button class="nav-btn" onclick="pasteClip()" title="Panoyu Yapıştır">📋</button>
     <button class="nav-btn" onclick="toggleFs()" title="Tam Ekran">⛶</button>
@@ -685,7 +704,7 @@ HTML = r"""<!doctype html>
   <div class="stage" id="stage">
     <div class="img-wrap">
       <img id="scr" src="/frame.jpg" tabindex="0" alt="Chromium Live Stream">
-      <div class="hud-overlay" id="hud-overlay">1920×1080 · Bağlanıyor...</div>
+      <div class="hud-overlay" id="hud-overlay">1920×1080 HW-JPEG · Bağlanıyor...</div>
     </div>
   </div>
 
@@ -720,9 +739,9 @@ HTML = r"""<!doctype html>
       <div class="card-sub" id="t-pwr">-- W · -- mA · -- V</div>
     </div>
     <div class="card">
-      <div class="card-top"><span>AKIŞ & SEKMELER</span><span id="t-tabcnt">0 sekme</span></div>
+      <div class="card-top"><span>AKIŞ & ENCODE</span><span id="t-tabcnt">0 sekme</span></div>
       <div class="card-val" id="t-stream">-- FPS · -- KB/s</div>
-      <div class="card-sub" id="t-res">1280×720 JPEG · q=65</div>
+      <div class="card-sub" id="t-res">HW-JPEG /dev/video3 · 1080p</div>
     </div>
   </div>
 </div>
@@ -736,10 +755,9 @@ let framesThisSec = 0;
 let bytesThisSec = 0;
 let lastBlobUrl = null;
 let lastMoveTs = 0;
-let wsConnected = false;
 let curW = 1920;
 let curH = 1080;
-let curFmtLabel = 'JPEG q=90';
+let curModeLabel = 'HW-JPEG /dev/video3';
 
 urlInput.addEventListener('focus', () => currentUrlFocused = true);
 urlInput.addEventListener('blur', () => currentUrlFocused = false);
@@ -748,7 +766,6 @@ function connectStreamWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws/stream`);
   ws.binaryType = 'blob';
-  ws.onopen = () => { wsConnected = true; };
   ws.onmessage = (ev) => {
     framesThisSec++;
     bytesThisSec += ev.data.size;
@@ -757,10 +774,7 @@ function connectStreamWS() {
     if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
     lastBlobUrl = url;
   };
-  ws.onclose = () => {
-    wsConnected = false;
-    setTimeout(connectStreamWS, 700);
-  };
+  ws.onclose = () => setTimeout(connectStreamWS, 700);
 }
 connectStreamWS();
 
@@ -772,7 +786,7 @@ setInterval(() => {
   document.getElementById('pill-fps').textContent = `FPS: ${fps}`;
   document.getElementById('pill-bw').textContent = `${kbps} KB/s`;
   document.getElementById('t-stream').textContent = `${fps} FPS · ${kbps} KB/s`;
-  document.getElementById('hud-overlay').textContent = `${curW}×${curH} (${curFmtLabel}) · ${fps} FPS · ${kbps} KB/s`;
+  document.getElementById('hud-overlay').textContent = `${curW}×${curH} (${curModeLabel}) · ${fps} FPS · ${kbps} KB/s`;
 }, 1000);
 
 async function sendCtrl(payload) {
@@ -890,14 +904,14 @@ async function refreshTelemetry() {
 
     curW = t.stream_cfg.maxWidth;
     curH = t.stream_cfg.maxHeight;
-    curFmtLabel = t.stream_cfg.format === 'png' ? 'NATIVE PNG' : `JPEG q=${t.stream_cfg.quality}`;
-    document.getElementById('t-res').textContent = `${curW}×${curH} ${curFmtLabel} · ${t.stream_cfg.everyNthFrame}x`;
-    const rSel = document.getElementById('sel-res');
-    if (document.activeElement !== rSel) rSel.value = `${curW}x${curH}`;
-    const qSel = document.getElementById('sel-qual');
-    if (document.activeElement !== qSel) qSel.value = t.stream_cfg.format === 'png' ? 'png:100' : `jpeg:${t.stream_cfg.quality}`;
-    const nSel = document.getElementById('sel-nth');
-    if (document.activeElement !== nSel) nSel.value = String(t.stream_cfg.everyNthFrame);
+    if (t.stream_cfg.engine === 'hwjpeg') {
+      curModeLabel = 'HW-JPEG /dev/video3';
+      document.getElementById('pill-eng').textContent = 'ENC: HW /dev/video3';
+    } else {
+      curModeLabel = t.stream_cfg.format === 'png' ? 'NATIVE PNG' : 'CDP JPEG';
+      document.getElementById('pill-eng').textContent = `ENC: ${curModeLabel}`;
+    }
+    document.getElementById('t-res').textContent = `${curW}×${curH} · ${curModeLabel}`;
   } catch (e) {}
 }
 setInterval(refreshTelemetry, 1200);
@@ -913,17 +927,17 @@ async function toggleGpuPerf() {
 }
 
 async function applyStreamCfg() {
-  const [wStr, hStr] = document.getElementById('sel-res').value.split('x');
-  const [fmt, qStr] = document.getElementById('sel-qual').value.split(':');
-  const everyNthFrame = parseInt(document.getElementById('sel-nth').value, 10);
+  const [engine, wh, fmt, qStr] = document.getElementById('sel-mode').value.split(':');
+  const [wStr, hStr] = wh.split('x');
   curW = parseInt(wStr, 10);
   curH = parseInt(hStr, 10);
-  const quality = parseInt(qStr, 10);
-  curFmtLabel = fmt === 'png' ? 'NATIVE PNG' : `JPEG q=${quality}`;
   await fetch('/api/stream_cfg', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({maxWidth: curW, maxHeight: curH, format: fmt, quality, everyNthFrame})
+    body: JSON.stringify({
+      engine, maxWidth: curW, maxHeight: curH, format: fmt, quality: parseInt(qStr, 10), everyNthFrame: 1
+    })
   });
+  refreshTelemetry();
 }
 
 async function pasteClip() {
@@ -1090,6 +1104,8 @@ async def api_gpu_perf(request):
 
 async def api_stream_cfg(request):
     body = await request.json()
+    if body.get("engine") in ("hwjpeg", "cdp"):
+        stream_cfg["engine"] = body["engine"]
     if body.get("format") in ("jpeg", "png"):
         stream_cfg["format"] = body["format"]
     if "quality" in body:
@@ -1099,7 +1115,7 @@ async def api_stream_cfg(request):
     if "maxWidth" in body and "maxHeight" in body:
         stream_cfg["maxWidth"] = max(640, min(3840, int(body["maxWidth"])))
         stream_cfg["maxHeight"] = max(480, min(2160, int(body["maxHeight"])))
-    await restart_screencast()
+    await apply_tab_stream_mode()
     return web.json_response({"ok": True, "stream_cfg": stream_cfg})
 
 

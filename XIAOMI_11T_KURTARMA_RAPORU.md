@@ -249,6 +249,22 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 3. **Şarj Eşiği Histerezisi Güncellemesi (`scripts/charge-limit.sh`):**
    - Önceki `%60` alt eşiği yüzünden pil `%62–%64` aralığındayken `input_suspend = 1` kalarak şarj başlamıyordu; alt eşik **`<= %67`** (üst eşik **`>= %70`**) olarak güncellendi ve `input_suspend = 0` sıfırlandı.
 
+### Adım 16: Weston Donanım JPEG Modülü (`weston_hwjpeg.so`), Sıfır CPU Screencast & Gelişmiş Web Konsolu (`:8080`)
+1. **CPU `Page.startScreencast` Darboğazının Tamamen Kaldırılması (`scripts/weston_hwjpeg.c` → `/usr/local/lib/weston_hwjpeg.so`):**
+   - Chromium'un `Page.startScreencast` komutu kareleri GPU'dan okuyup CPU'da JPEG/PNG sıkıştırdığı için 1080p ve çoklu sekmede yüksek CPU ve düşük FPS üretiyordu.
+   - `libweston-9-dev` ile özel **Weston C eklentisi (`weston_hwjpeg.so`)** yazıldı:
+     - `weston --backend=headless-backend.so --use-pixman --shell=kiosk-shell.so` içinde her yeni karede (`output->frame_signal`) piksel verisini doğrudan çift tampona alır.
+     - Worker thread **ARM64 NEON SIMD (`vld4_u8`)** ile `BGRA → YUYV` renk dönüşümü yapıp MediaTek **ION `0x400` DMA-BUF** üzerinden **`/dev/video3` (`mtk-jpeg-enc`)** donanım JPEG motoruna verir.
+     - Çıkan ham JPEG karelerini `/tmp/weston_hwjpeg.sock` Unix soketinden doğrudan Python sunucusuna aktarır (`Page.startScreencast` ve base64 tamamen devre dışı).
+   - **Ölçülen Canlı Sonuçlar (`WebGL Aquarium`, Mali-G77 `886 MHz`):**
+     - `1280×720` HW-JPEG: **36.4 FPS** (Weston CPU `%14.7`)
+     - `1920×1080` HW-JPEG (1 sekme): **28.8 FPS** (`~14.7 MB/s`)
+     - `1920×1080` HW-JPEG (**6 sekme eşzamanlı açıkken**, arka plan throttle aktif): **23.4 FPS** (`%33.3` toplam CPU, `66.3°C`)
+2. **Profesyonel Web Tarayıcı Konsolu (`scripts/chrome_stream_server.py`, `:8080`):**
+   - Modern koyu arayüz, gerçek Chromium çoklu sekme yönetimi (`+` yeni sekme, sekme geçişi, `×` kapatma), adres/arama çubuğu, yer imleri, canlı Stream FPS & KB/s göstergesi.
+   - Encode modu / kalite seçici: **`HW-JPEG 1080p (/dev/video3)`** (varsayılan), **`Native 1080p (Kayıpsız PNG)`**, **`2K QHD 1440p`** ve **`4K UHD 2160p (Kayıpsız PNG)`**.
+   - Tek tıkla **`GPU: MAX 886MHz` / `AUTO`** (`scripts/gpu-perf.sh`) anahtarı ve alt kısımda 6 kartlı canlı telefon telemetrisi (CPU, GPU/VRAM, RAM, 5 sıcaklık, Batarya/Güç/Şarj Limiti, Akış).
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -271,8 +287,10 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı + `%67–%70` şarj kesici |
 | `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `pyte`/`tmux` terminal + Güç tuşu ekran aç/kapa |
 | `scripts/libhybris_mali_agate.patch` | `libhybris` Mali-G77 MC9 (`Android 11` / `MT6893` `/dev/ion` & ANGLE) tam yaması |
+| `scripts/weston_hwjpeg.c` | Weston C modülü: ARM64 NEON + ION `0x400` + `/dev/video3` donanım JPEG akış eklentisi |
 | `scripts/hwjpeg_v4l2.c` | `/dev/video3` & `/dev/video4` ION `0x400` V4L2 DMABUF donanım JPEG kütüphanesi (`/usr/local/lib/libhwjpeg.so`) |
-| `scripts/chrome-gpu.sh` & `scripts/chrome_stream_server.py` | Mali-G77 GPU hızlandırmalı Chromium 156 başlatıcısı ve `:8080` canlı akış sunucusu |
+| `scripts/gpu-perf.sh` | Mali-G77 `886 MHz` max performans / `auto` DVFS geçiş aracı (`/usr/local/bin/gpu-perf`) |
+| `scripts/chrome-gpu.sh` & `scripts/chrome_stream_server.py` | Mali-G77 GPU + `/dev/video3` HW-JPEG destekli Chromium 156 konsolu (`:8080`) |
 | `scripts/geri_donus_v1259_fastboot.ps1` & `geri_donus_v1302_fastboot.ps1` | Bootloader kilitlemeden Android 11 / Android 12 geri dönüş betikleri |
 
 ---
@@ -280,20 +298,13 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 ## 6. Durum Özeti
 
 - **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
-- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — **USB RNDIS**, **Wi-Fi (`192.168.2.212:2222`)**, **`%67–%70` şarj kesici**, **`/dev/fb0` telemetri dashboard'u**, **Mali-G77 MC9 GPU hızlandırmalı Chromium 156** ve **çift donanım JPEG kodlayıcı (`libhwjpeg.so`, ~280 FPS 720p)** aktif.
+- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — **USB RNDIS**, **Wi-Fi (`192.168.2.212:2222`)**, **`%67–%70` şarj kesici**, **`/dev/fb0` telemetri dashboard'u**, **Mali-G77 MC9 GPU (`886 MHz`) hızlandırmalı Chromium 156** ve **`weston_hwjpeg.so` (`/dev/video3` donanım JPEG @ ~29 FPS 1080p)** aktif.
 - **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır.
 
 ---
 
-## 7. Devam Edilecek Sıradaki Adımlar (10 Chrome Penceresi Donanım Encode)
+## 7. Devam Edilecek Sıradaki Adımlar (İsteğe Bağlı)
 
-### A. Çözülenler & Aktif Donanım Düğümleri
-- **GPU ÇÖZÜLDÜ:** **`Mali-G77 MC9`** (`/dev/mali0` + `libhybris` `/usr/local/hybris/lib`) **OpenCL 2.1**, **OpenGL ES 3.2** ve **Chromium 156 WebGL 2.0 (`ANGLE (ARM, Mali-G77 MC9, OpenGL ES 3.2)`)** ile tam çalışır durumda.
-- **DONANIM JPEG ÇÖZÜLDÜ:** **`/dev/video3`** & **`/dev/video4`** (`mtk-jpeg-enc` + `/dev/ion` `0x400`) tek başına motor başı `~141 FPS`, `libhwjpeg.so` üzerinden Python ile `117.5 FPS` `RGBA → JPEG` veriyor.
-- **VCU / H.264 Notu:** `/dev/video2` (`mtk-vcodec-enc`) `/vendor/bin/vpud` VCU servisi olmadan yetenek bildirmiyor (`encoder capability 0`).
-
-### B. Sıradaki Somut Plan
-1. **10 Eşzamanlı Chrome Penceresi + `libhwjpeg.so` Akışı:**
-   - Tek Mali-G77 GPU'lu Chromium prosesinde 10 izole `BrowserContext` (`Target.createTarget`) + `zram` swap (`4 GB`) + `/dev/video3`/`/dev/video4` donanım JPEG havuzu bağlamak.
-2. **Ses Akışı (Gerektiğinde):** `PulseAudio` `module-null-sink` üzerinden WebSocket/Opus ses aktarımı.
-3. **Depolama Genişletme & Özel Kernel (Opsiyonel):** `userdata` (`106 GB`) bölümünü ext4 Ubuntu diski yapmak ve gerekirse `CONFIG_USER_NS`/`SYSVIPC`/`DEVTMPFS` açık özel kernel derlemek.
+1. **10 Eşzamanlı Chrome Penceresi + `4 GB zram`:** Aynı yapıya `zram` swap eklenip 10 izole `BrowserContext` üzerinde `/dev/video3` + `/dev/video4` paralel akışı genişletilebilir.
+2. **Ses Akışı:** `PulseAudio` `module-null-sink` üzerinden WebSocket/Opus ses aktarımı.
+3. **Depolama Genişletme & Özel Kernel:** `userdata` (`106 GB`) bölümünü ext4 Ubuntu diski yapmak ve gerekirse `CONFIG_USER_NS`/`SYSVIPC`/`DEVTMPFS` açık özel kernel derlemek.
