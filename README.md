@@ -209,6 +209,18 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
   - [`geri_donus_v1302_fastboot.ps1`](scripts/geri_donus_v1302_fastboot.ps1): Bootloader açık şekilde Android 12 `V13.0.2.0.SKWMIXM` (+ isteğe bağlı `-WithMagisk`) kurar.
 - *(Not: Cihaza özel `nvram`, `nvdata`, `proinfo`, `seccfg`, `persist`, `protect1/2`, `otp` imajları hem dosya boyutu hem de gizlilik/IMEI güvenliği nedeniyle herkese açık GitHub reposuna konmamış, yerel `telefon-yedek\partisyonlar\` ve `geri-donus\` klasörlerinde `SHA256SUMS.txt` ile korunmuştur.)*
 
+### Adım 13: Telefon Ekranı Telemetri Arayüzü, Canlı SSH Aynalama, ARM64 Chromium 156 ve Video Akış Prototipi (14 Kasım)
+1. **Framebuffer Canlı Dashboard & Terminal (`scripts/fbui.py` & `scripts/ekran.sh`):**
+   - Stok `4.14.186` çekirdek `CONFIG_VT` içermediği için doğrudan `/dev/fb0` (`1080×2400`, `stride=4352`, 32-bit RGBA) üzerine `python3-pil` + `DejaVuSansMono.ttf` ile özel bir konsol arayüzü yazıldı.
+   - **Canlı Telemetri Kartı:** CPU yükü (%) + 3 küme frekansları (`cpu0/cpu4/cpu7`), GPU kullanımı (`/sys/kernel/ged/hal/gpu_utilization`, Mali güç durumu), RAM kullanımı, anlık güç tüketimi (**Watt**, **mA**, **Voltaj**), batarya yüzdesi + şarj kesme durumu ve 5 gerçek termal sensör (`mtktscpu`, `mtktsAP`, `mtktspmic`, `mtktswmt`, `battery`) anlık çizilir.
+   - **Fiziksel Tuş Kontrolü (`/dev/input/event1` `mtk-kpd`):** Güç tuşuna (`KEY_POWER = 116`) her basışta ekran açılıp kapatılır; Ses+/Ses- kapalı ekranı uyandırır. SSH üzerinden `ekran ac|kapat|toggle|durum|baglan|cmd` komutları eklendi.
+   - **Canlı SSH ↔ Telefon Ekranı Aynalama:** `python3-pyte` VT100/ANSI emülatörü + `tmux -S /tmp/fbconsole.sock` (`66×50`) bağlandı ve `/home/ubuntu/.bashrc` içine etkileşimli SSH otomatik bağlantısı eklendi (`ssh -p 2222 ubuntu@192.168.2.212` doğrudan telefon ekranındaki `tmux` oturumuna düşer; `Ctrl+B D` ile ayrılınır).
+   - **İzin Düzeltmesi:** `busybox mdev -s` sonrasında `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty`, `/dev/ptmx` izinlerinin `0666` yapılması `/sbin/linux_init` sonuna sabitlendi.
+2. **Snap'siz Native ARM64 Chromium 156 ve Video Akışı (`scripts/chrome_stream_server.py`):**
+   - Ubuntu `snapd` `systemd`'siz ortamda çalışmadığı için `ppa:xtradeb/apps` (Jammy `arm64`) deposundan native `.deb` **`Chromium 156.0.8078.73`** kuruldu (`--headless --no-sandbox --disable-gpu --dump-dom` doğrulandı, diskte `1.3 GB` boş alan korundu).
+   - `python3-aiohttp` ile `/opt/chrome_stream/server.py` geliştirildi: Chromium CDP `Page.startScreencast` üzerinden `1280×720` kareleri yakalayıp `:8080/` (etkileşimli uzaktan kontrol), `:8080/stream.mjpg` (ham MJPEG akışı) ve `:8080/frame.jpg` olarak sundu (kablosuz Wi-Fi'den canlı görüntülendi).
+   - Gün sonu soğutma ve ertesi günkü özel yazılım geliştirme çalışması öncesinde `chrome_stream` süreci durduruldu (kod `/opt/chrome_stream/server.py` ve repoda hazır bekler).
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -229,6 +241,8 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/setup_ubuntu.sh` | Android üzerinde 32 GB sparse `ext4` loop imajına Ubuntu 22.04 kurulumu |
 | `scripts/build_native_boot.py` | Stok `kernel` + `dtb` + statik `busybox` `initramfs` ile Android'siz `boot.img` üreticisi |
 | `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı (RNDIS + MTK Wi-Fi + SSH + ekran karartma + %60–%70 şarj kesici) |
+| `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `pyte`/`tmux` terminal + Güç tuşu ekran aç/kapa |
+| `scripts/chrome_stream_server.py` | Chromium 156 CDP `Page.startScreencast` → MJPEG / web uzaktan kontrol sunucusu (`:8080`) |
 | `scripts/geri_donus_v1259_fastboot.ps1` & `geri_donus_v1302_fastboot.ps1` | Bootloader kilitlemeden Android 11 / Android 12 geri dönüş betikleri |
 
 ---
@@ -236,6 +250,33 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 ## 6. Durum Özeti
 
 - **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
-- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — `super` boş alanındaki 2.2 GB `ext4` bölümünden açılıyor; **USB RNDIS (`192.168.77.1:2222`)**, **Wi-Fi (`192.168.2.212:2222`)**, **%60–%70 şarj kesici** ve **AMOLED ekran karartma** aktif (~7 GB boş RAM).
-- **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak hazırlandı.
-- **Sıradaki Opsiyonel Adımlar:** `userdata` (`106 GB`) bölümünü tamamen Ubuntu diski yapma, Docker/Chromium için özel kernel derleme veya istenildiğinde tek komutla Android 11/12'ye geri dönme.
+- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — `super` boş alanındaki 2.2 GB `ext4` bölümünden (`1.3 GB` boş) açılıyor; **USB RNDIS (`192.168.77.1:2222`)**, **Wi-Fi (`192.168.2.212:2222`)**, **%60–%70 şarj kesici**, **telemetrili `/dev/fb0` ekran arayüzü** (`Güç` tuşuyla aç/kapa, otomatik SSH `tmux` aynalama) ve **ARM64 Chromium 156** aktif.
+- **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır.
+
+---
+
+## 7. Yarınki Oturum İçin Devir Notu (Handoff — Sıfır Bilgiyle Devam Rehberi)
+
+Bu bölümü yeni bir oturumda sıfırdan başlarken bağlamı anında yüklemek için kullanabilirsiniz:
+
+### A. Cihazın Şu Anki Canlı Durumu
+- **Cihaz:** Xiaomi 11T (`agate`, MT6893 Dimensity 1200, 8 GB RAM, 128 GB UFS), Bootloader **açık**.
+- **Çalışan OS:** Android yok — `boot_a` doğrudan `super` (`/dev/sdc62`, offset `6622253056`, 2.2 GB `ext4`) üzerindeki **Ubuntu 22.04.5 LTS** sistemini `/sbin/linux_init` ile PID 1 olarak başlatıyor.
+- **SSH Erişimi:** `ssh -p 2222 ubuntu@192.168.2.212` (Wi-Fi) veya `ssh -p 2222 ubuntu@192.168.77.1` (USB RNDIS) — geçici şifre `ubuntu`, bu PC'nin `id_ed25519.pub` anahtarı yüklü. Etkileşimli SSH otomatik olarak telefon ekranındaki `tmux` oturumuna (`ekran baglan`) düşer.
+- **Çekirdek:** `Linux 4.14.186-g1338473e1825 aarch64` (stok `V12.5.9.0` kernel + dtb).
+- **Aktif Donanım Düğümleri:**
+  - GPU: **`/dev/mali0`** (`10, 96` — Mali-G77 MC9 `mali_kbase` çekirdek sürücüsü yüklü ve hazır!).
+  - Ekran: `/dev/fb0` (`1080×2400`, `stride=4352`), `/sys/class/leds/lcd-backlight/brightness`, `/sys/class/graphics/fb0/blank`, `/dev/input/event1` (`mtk-kpd`, `KEY_POWER=116`).
+  - Pil Koruma: `/sys/class/power_supply/battery/input_suspend` (`charge-limit.sh`, %60–%70 arası tutar).
+  - Wi-Fi: `/vendor/lib/modules/` (`conninfra.ko`, `bt_drv.ko`, `wmt_chrdev_wifi.ko`, `wlan_drv_gen4m.ko`) + Bionic `conninfra_loader` / `wlan_assistant` ile sorunsuz çalışıyor.
+
+### B. Yarın Üzerinde Çalışılacak Ar-Ge Konuları
+1. **CPU Bağımlı Ekran/Video Encode Hızlandırma & Donanım GPU Kullanımı:**
+   - Mevcut `/opt/chrome_stream/server.py` denemesi CPU tabanlı (`SwiftShader` + Pillow/Chromium JPEG) çalıştığı için yük oluşturuyor (`chrome_stream` şu an durdurulmuş durumda).
+   - **Araştırma Başlıkları:**
+     1. **Mevcut `4.14.186` + `/dev/mali0` ile Donanım GPU Kullanımı:** Çekirdekte `mali_kbase` (`/dev/mali0`) zaten açık. Ubuntu `glibc` içinde doğrudan **`libhybris` + Android `/vendor/lib64/egl/libGLES_mali.so`** köprüsü (veya Bionic headless EGL/Vulkan/OpenCL wrapper) kurularak Chromium / özel C++ / Python uygulamalarında gerçek **Mali-G77 MC9 GPU** hızlandırması ve donanım **VENC (`MediaCodec` / `libvcodec`)** motoru kullanılabilir mi?
+     2. **Kendi Kernelimizi Derleme (`MiCode/Xiaomi_Kernel_OpenSource` — `agate-r-oss` / `agate-u-oss`):**
+        - `CONFIG_DEVTMPFS=y`, `CONFIG_USER_NS=y`, `CONFIG_SYSVIPC=y`, `CONFIG_CGROUP_PIDS=y`, `CONFIG_VT=y`, `CONFIG_WIREGUARD=y` açarak tam Docker + Chromium sandbox + native Linux uyumluluğu sağlamak (ayrıca `/vendor/lib/modules/` Wi-Fi modüllerini aynı kaynak ağaçtan `vermagic` uyumlu derlemek).
+        - Mainline / Mesa `Panfrost` durumu: MT6893 için mainline DRM/KMS & UFS henüz eksik olduğundan, `4.14.186` özel kernel + `mali_kbase` + `libhybris` veya CPU tarafında `libjpeg-turbo` (`ARMv8 NEON`) / dirty-rect diff akışı pratik yollardır.
+2. **Depolama Genişletme (Hazır Olunduğunda):**
+   - `userdata` (`106 GB`, `/dev/sdc76`) Android'e dönmeye gerek kalmadığına karar verildiğinde `ext4` formatlanıp Ubuntu rootfs oraya taşınabilir (`seccfg` / `lk_a` etkilenmediği için bootloader açık kalır).
