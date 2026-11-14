@@ -60,6 +60,7 @@ static int g_enc_ready = 0;
 static pthread_mutex_t g_cli_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_srv_fd = -1;
 static int g_cli_fd = -1;
+static volatile int g_force_frame = 0;
 
 static inline uint64_t now_ms(void) {
     struct timespec ts;
@@ -420,6 +421,7 @@ static void *accept_thread(void *arg) {
         pthread_mutex_lock(&g_cli_mu);
         if (g_cli_fd >= 0) close(g_cli_fd);
         g_cli_fd = cfd;
+        g_force_frame = 1;
         pthread_mutex_unlock(&g_cli_mu);
     }
     return NULL;
@@ -536,18 +538,21 @@ int main(int argc, char **argv) {
     unsigned long prev_serial = 0;
 
     while (g_running) {
+        uint64_t t = now_ms();
+        int has_cli = (g_cli_fd >= 0);
         int fb_changed = (memcmp(src, prev_raw, (size_t)FB_W * FB_H * 4) != 0);
         my_XFixesCursorImage *ci = (cur_dpy && pGetCursor) ? pGetCursor(cur_dpy) : NULL;
         int cur_changed = (ci && (ci->x != prev_cx || ci->y != prev_cy || ci->cursor_serial != prev_serial));
+        int need_hb = (g_force_frame || (has_cli && t - last_enc_ms >= 500));
 
-        if (fb_changed || cur_changed) {
+        if (fb_changed || cur_changed || need_hb) {
             if (fb_changed) memcpy(prev_raw, src, (size_t)FB_W * FB_H * 4);
             if (ci) { prev_cx = ci->x; prev_cy = ci->y; prev_serial = ci->cursor_serial; }
 
             memcpy(composed, prev_raw, (size_t)g_xv_w * g_xv_h * 4);
             if (ci) overlay_cursor(composed, g_xv_w, g_xv_h, ci);
 
-            if (g_screen_on && fb_map != MAP_FAILED) {
+            if ((fb_changed || cur_changed) && g_screen_on && fb_map != MAP_FAILED) {
                 if (!g_landscape) {
                     for (int y = 0; y < FB_H; y++) {
                         const uint32_t *srow = composed + y * FB_W;
@@ -572,9 +577,8 @@ int main(int argc, char **argv) {
                 ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
             }
 
-            uint64_t t = now_ms();
-            int has_cli = (g_cli_fd >= 0);
-            if ((has_cli && t - last_enc_ms >= 22) || (t - last_enc_ms >= 400)) {
+            if (need_hb || (has_cli && t - last_enc_ms >= 22) || (t - last_enc_ms >= 400)) {
+                g_force_frame = 0;
                 last_enc_ms = t;
                 pthread_mutex_lock(&g_enc_mu);
                 memcpy(g_enc_buf, composed, (size_t)g_xv_w * g_xv_h * 4);

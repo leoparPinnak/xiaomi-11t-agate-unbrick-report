@@ -406,7 +406,9 @@ HTML = r"""<!doctype html>
     <span class="pill" id="p-bw">-- KB/s</span>
     <span class="pill" id="p-tel">CPU --% · RAM --MB · --°C · Bat --%</span>
     <div class="spacer"></div>
-    <button class="btn" onclick="openChr()">🌐 Chromium Aç</button>
+    <button class="btn" onclick="openApp('chromium')">🌐 Chromium</button>
+    <button class="btn" onclick="openApp('terminal')">💻 Terminal</button>
+    <button class="btn" onclick="openApp('files')">📁 Dosyalar</button>
     <button class="btn" onclick="toggleScr()">💡 Ekran Işığı</button>
     <button class="btn" onclick="rotateMode('yatay')">📱↔ Yatay</button>
     <button class="btn" onclick="rotateMode('dikey')">📱↕ Dikey</button>
@@ -493,7 +495,7 @@ async function refreshTel() {
 setInterval(refreshTel, 1500);
 refreshTel();
 
-async function openChr() { await fetch('/api/open_chromium', {method:'POST'}); }
+async function openApp(app) { await fetch('/api/open_app', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({app})}); }
 async function toggleScr() { await fetch('/api/screen_toggle', {method:'POST'}); refreshTel(); }
 async function rotateMode(m) { await fetch('/api/rotate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode:m})}); }
 function toggleFs() {
@@ -646,13 +648,26 @@ async def api_screen_toggle(request):
     return web.json_response({"ok": True})
 
 
+async def api_open_app(request):
+    body = await request.json() if request.can_read_body else {}
+    app = body.get("app", "chromium")
+    w, h = get_screen_dims()
+    if app == "terminal":
+        cmd = "DISPLAY=:0 nohup xfce4-terminal --geometry=120x32+80+60 >/tmp/term_xfce.log 2>&1 &"
+    elif app == "files":
+        cmd = "DISPLAY=:0 nohup thunar /home/ubuntu >/tmp/thunar_xfce.log 2>&1 &"
+    else:
+        cmd = (
+            f"DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage "
+            f"--new-window --window-size={w},{max(600, h - 80)} --window-position=0,28 "
+            f"--user-data-dir=/home/ubuntu/.config/chr_xfce https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &"
+        )
+    subprocess.Popen(["su", "-", "ubuntu", "-c", cmd])
+    return web.json_response({"ok": True, "app": app})
+
+
 async def api_open_chromium(request):
-    subprocess.Popen([
-        "su", "-", "ubuntu", "-c",
-        "DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage "
-        "--user-data-dir=/home/ubuntu/.config/chr_xfce https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &"
-    ])
-    return web.json_response({"ok": True})
+    return await api_open_app(request)
 
 
 async def api_rotate(request):
@@ -677,6 +692,7 @@ async def main():
     app.router.add_get("/frame.jpg", frame_jpg)
     app.router.add_get("/api/telemetry", api_telemetry)
     app.router.add_post("/api/screen_toggle", api_screen_toggle)
+    app.router.add_post("/api/open_app", api_open_app)
     app.router.add_post("/api/open_chromium", api_open_chromium)
     app.router.add_post("/api/rotate", api_rotate)
     app.router.add_post("/input", handle_input)
