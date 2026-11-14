@@ -87,12 +87,17 @@ def collect_telemetry():
         except Exception:
             pass
     mali = _rfile("/proc/mali/utilization", "")
-    mu = re.search(r"gpu/cljs0/cljs1=(\d+)/(\d+)/(\d+)", mali)
-    if mu:
-        gpu_pct = max(gpu_pct, int(mu.group(1)), int(mu.group(2)), int(mu.group(3)))
-    mpwr = re.search(r"\):(\d+)", mali)
-    if mpwr and int(mpwr.group(1)) > 0:
-        gpu_pwr = "ON"
+    for _ in range(3):
+        mu = re.search(r"gpu/cljs0/cljs1=(\d+)/(\d+)/(\d+)", mali)
+        if mu:
+            gpu_pct = max(gpu_pct, int(mu.group(1)), int(mu.group(2)), int(mu.group(3)))
+        mpwr = re.search(r"\):(\d+)", mali)
+        if mpwr and int(mpwr.group(1)) > 0:
+            gpu_pwr = "ON"
+        if gpu_pct > 0:
+            break
+        time.sleep(0.005)
+        mali = _rfile("/proc/mali/utilization", "")
 
     gfreq = _rfile("/proc/gpufreq/gpufreq_var_dump", "")
     mf = re.search(r"idx:\s*\d+,\s*freq:\s*(\d+)", gfreq)
@@ -681,10 +686,10 @@ HTML = r"""<!doctype html>
       <button class="go-btn" onclick="nav()">Git</button>
     </div>
     <select class="ctrl-select" id="sel-mode" onchange="applyStreamCfg()" title="Encode Motoru & Kalite">
-      <option value="hwjpeg:1920x1080:jpeg:90" selected>HW-JPEG 1080p (/dev/video3)</option>
-      <option value="cdp:1920x1080:png:100">Native 1080p (Kayıpsız PNG)</option>
-      <option value="cdp:2560x1440:jpeg:95">2K QHD 1440p (CDP)</option>
-      <option value="cdp:3840x2160:png:100">4K UHD 2160p (Kayıpsız PNG)</option>
+      <option value="hwjpeg:1920x1080:jpeg:90" selected>HW-JPEG 1080p (/dev/video3 · Donanım)</option>
+      <option value="cdp:1920x1080:png:100">Native 1080p (CPU Kayıpsız PNG)</option>
+      <option value="cdp:2560x1440:jpeg:95">2K QHD 1440p (CPU CDP)</option>
+      <option value="cdp:3840x2160:png:100">4K UHD 2160p (CPU Kayıpsız PNG)</option>
     </select>
     <button class="nav-btn" onclick="pasteClip()" title="Panoyu Yapıştır">📋</button>
     <button class="nav-btn" onclick="toggleFs()" title="Tam Ekran">⛶</button>
@@ -904,14 +909,26 @@ async function refreshTelemetry() {
 
     curW = t.stream_cfg.maxWidth;
     curH = t.stream_cfg.maxHeight;
+    const engEl = document.getElementById('pill-eng');
     if (t.stream_cfg.engine === 'hwjpeg') {
       curModeLabel = 'HW-JPEG /dev/video3';
-      document.getElementById('pill-eng').textContent = 'ENC: HW /dev/video3';
+      engEl.textContent = 'ENC: HW /dev/video3';
+      engEl.style.color = '#86efac';
+      engEl.style.borderColor = 'rgba(34,197,94,.45)';
     } else {
-      curModeLabel = t.stream_cfg.format === 'png' ? 'NATIVE PNG' : 'CDP JPEG';
-      document.getElementById('pill-eng').textContent = `ENC: ${curModeLabel}`;
+      curModeLabel = t.stream_cfg.format === 'png' ? 'CPU NATIVE PNG' : 'CPU CDP JPEG';
+      engEl.textContent = `ENC: ${curModeLabel}`;
+      engEl.style.color = '#fbbf24';
+      engEl.style.borderColor = 'rgba(245,158,11,.5)';
     }
     document.getElementById('t-res').textContent = `${curW}×${curH} · ${curModeLabel}`;
+    const mSel = document.getElementById('sel-mode');
+    if (document.activeElement !== mSel) {
+      const key = `${t.stream_cfg.engine}:${curW}x${curH}:${t.stream_cfg.format}:${t.stream_cfg.quality}`;
+      for (const opt of mSel.options) {
+        if (opt.value === key) { mSel.value = key; break; }
+      }
+    }
   } catch (e) {}
 }
 setInterval(refreshTelemetry, 1200);
