@@ -97,7 +97,6 @@ class UdpTransport:
         self._sendto(b"AGTH")
 
     def send_mouse(self, act: int, btn: int, x: int, y: int):
-        pkt = struct.pack("<4sBBhh", b"AGTI\x01"[:4], 1, act, btn)[:6]
         pkt = b"AGTI" + struct.pack("<BBBhh", 1, act, btn, x, y)
         self._sendto(pkt)
 

@@ -783,6 +783,8 @@ int main(int argc, char **argv) {
 
     /* Load X11 + XFixes to read real cursor shape & position */
     void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
+    int (*pXInitThreads)(void) = hx11 ? dlsym(hx11, "XInitThreads") : NULL;
+    if (pXInitThreads) pXInitThreads();
     void *hxfix = dlopen("libXfixes.so.3", RTLD_NOW);
     void *(*pXOpenDisplay)(const char *) = hx11 ? dlsym(hx11, "XOpenDisplay") : NULL;
     int (*pXFree)(void *) = hx11 ? dlsym(hx11, "XFree") : NULL;
