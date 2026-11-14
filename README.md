@@ -265,18 +265,23 @@ Bu bölümü yeni bir oturumda sıfırdan başlarken bağlamı anında yüklemek
 - **SSH Erişimi:** `ssh -p 2222 ubuntu@192.168.2.212` (Wi-Fi) veya `ssh -p 2222 ubuntu@192.168.77.1` (USB RNDIS) — geçici şifre `ubuntu`, bu PC'nin `id_ed25519.pub` anahtarı yüklü. Etkileşimli SSH otomatik olarak telefon ekranındaki `tmux` oturumuna (`ekran baglan`) düşer.
 - **Çekirdek:** `Linux 4.14.186-g1338473e1825 aarch64` (stok `V12.5.9.0` kernel + dtb).
 - **Aktif Donanım Düğümleri:**
-  - GPU: **`/dev/mali0`** (`10, 96` — Mali-G77 MC9 `mali_kbase` çekirdek sürücüsü yüklü ve hazır!).
+  - GPU & DRM: **`/dev/mali0`** (`10, 96` — Mali-G77 MC9 `mali_kbase`), **`/dev/dri/card0`** (`226, 0`), **`/dev/ion`** (`10, 123`), **`/dev/mtk_mdp`** (`245, 0` — donanım ölçekleme/renk dönüştürme).
+  - Donanım Video & JPEG Kodlayıcılar (`CONFIG_VIDEO_V4L2=y`, `CONFIG_V4L2_MEM2MEM_DEV=y`, `CONFIG_VIDEO_MEDIATEK_JPEG=y`):
+    - **`/dev/video1`**: `mtk-vcodec-dec` (81:1)
+    - **`/dev/video2`**: `mtk-vcodec-enc` (81:2 — H.264/HEVC V4L2 encoder)
+    - **`/dev/video3`** & **`/dev/video4`**: Çift donanım `mtk-jpeg-enc` (81:3, 81:4 — `17030000.jpgenc` & `17830000.jpgenc`)
+    - **`/dev/vcu`**: Video Codec Unit (`477, 0`)
   - Ekran: `/dev/fb0` (`1080×2400`, `stride=4352`), `/sys/class/leds/lcd-backlight/brightness`, `/sys/class/graphics/fb0/blank`, `/dev/input/event1` (`mtk-kpd`, `KEY_POWER=116`).
   - Pil Koruma: `/sys/class/power_supply/battery/input_suspend` (`charge-limit.sh`, %60–%70 arası tutar).
   - Wi-Fi: `/vendor/lib/modules/` (`conninfra.ko`, `bt_drv.ko`, `wmt_chrdev_wifi.ko`, `wlan_drv_gen4m.ko`) + Bionic `conninfra_loader` / `wlan_assistant` ile sorunsuz çalışıyor.
 
-### B. Yarın Üzerinde Çalışılacak Ar-Ge Konuları
+### B. Yarın Üzerinde Çalışılacak Ar-Ge Konuları (Hedef: Aynı Anda 10 Chrome Penceresi Donanım Encode)
 1. **CPU Bağımlı Ekran/Video Encode Hızlandırma & Donanım GPU Kullanımı:**
-   - Mevcut `/opt/chrome_stream/server.py` denemesi CPU tabanlı (`SwiftShader` + Pillow/Chromium JPEG) çalıştığı için yük oluşturuyor (`chrome_stream` şu an durdurulmuş durumda).
-   - **Araştırma Başlıkları:**
-     1. **Mevcut `4.14.186` + `/dev/mali0` ile Donanım GPU Kullanımı:** Çekirdekte `mali_kbase` (`/dev/mali0`) zaten açık. Ubuntu `glibc` içinde doğrudan **`libhybris` + Android `/vendor/lib64/egl/libGLES_mali.so`** köprüsü (veya Bionic headless EGL/Vulkan/OpenCL wrapper) kurularak Chromium / özel C++ / Python uygulamalarında gerçek **Mali-G77 MC9 GPU** hızlandırması ve donanım **VENC (`MediaCodec` / `libvcodec`)** motoru kullanılabilir mi?
-     2. **Kendi Kernelimizi Derleme (`MiCode/Xiaomi_Kernel_OpenSource` — `agate-r-oss` / `agate-u-oss`):**
-        - `CONFIG_DEVTMPFS=y`, `CONFIG_USER_NS=y`, `CONFIG_SYSVIPC=y`, `CONFIG_CGROUP_PIDS=y`, `CONFIG_VT=y`, `CONFIG_WIREGUARD=y` açarak tam Docker + Chromium sandbox + native Linux uyumluluğu sağlamak (ayrıca `/vendor/lib/modules/` Wi-Fi modüllerini aynı kaynak ağaçtan `vermagic` uyumlu derlemek).
-        - Mainline / Mesa `Panfrost` durumu: MT6893 için mainline DRM/KMS & UFS henüz eksik olduğundan, `4.14.186` özel kernel + `mali_kbase` + `libhybris` veya CPU tarafında `libjpeg-turbo` (`ARMv8 NEON`) / dirty-rect diff akışı pratik yollardır.
+   - Mevcut `/opt/chrome_stream/server.py` (anti-bot bayrakları + `1920×1080` eklendi) CPU tabanlı (`SwiftShader` + yazılım JPEG) çalışıyor.
+   - **Yarınki Somut Test Planı (10 Eşzamanlı Chrome Penceresi Hedefi):**
+     1. **Donanım JPEG & Video Kodlayıcı (`V4L2 M2M`):** Çekirdekte zaten açık olan **`/dev/video3` & `/dev/video4` (`mtk-jpeg-enc`)** ve **`/dev/video2` (`mtk-vcodec-enc`)** düğümlerine doğrudan Linux `V4L2` `ioctl` (`v4l2-ctl` / küçük C/Python V4L2 M2M test aracı) ile bağlanıp sıfır CPU ile donanım JPEG / H.264 encode edilip edilemediğini test etmek (`mtk-vcodec-enc` VCU daemon isterse Android `/vendor/bin/vcu*` ikililerini bağlamak).
+     2. **Mali-G77 MC9 GPU Hızlandırması (`/dev/mali0`):** Ubuntu `glibc` içinde **`libhybris` + Android `/vendor/lib64/egl/libGLES_mali.so`** köprüsüyle gerçek Mali-G77 EGL/GLES hızlandırmasını açıp Chromium/render yükünü CPU'dan GPU'ya taşımak.
+     3. **Çoklu Pencere Mimarisi:** 10 pencere için tek Chromium prosesi içinde 10 ayrı `Target.createTarget` + `BrowserContext` (izole profil/çerez, 10 ayrı process yerine tek browser + renderer paylaşımı -> ~3–4 GB RAM) + `zram` swap + donanım encode (`video3`/`video4`/`video2`).
+     4. **Kendi Kernelimizi Derleme (`MiCode/Xiaomi_Kernel_OpenSource` — `agate-r-oss` / `agate-u-oss`):** `CONFIG_DEVTMPFS=y`, `CONFIG_USER_NS=y`, `CONFIG_SYSVIPC=y`, `CONFIG_CGROUP_PIDS=y`, `CONFIG_VT=y`, `CONFIG_WIREGUARD=y` açıp tam Docker/sandbox desteği sağlamak.
 2. **Depolama Genişletme (Hazır Olunduğunda):**
    - `userdata` (`106 GB`, `/dev/sdc76`) Android'e dönmeye gerek kalmadığına karar verildiğinde `ext4` formatlanıp Ubuntu rootfs oraya taşınabilir (`seccfg` / `lk_a` etkilenmediği için bootloader açık kalır).
