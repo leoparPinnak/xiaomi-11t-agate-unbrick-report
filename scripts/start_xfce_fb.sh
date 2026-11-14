@@ -5,18 +5,33 @@ pkill -f fb_xfce_bridge 2>/dev/null || true
 pkill -f "Xvfb :0" 2>/dev/null || true
 pkill -f "xfce4-session" 2>/dev/null || true
 pkill -f "chr_xfce" 2>/dev/null || true
+pkill -f "/opt/chrome_stream/xfce_server.py" 2>/dev/null || true
+pkill -f "/opt/chrome_stream/server.py" 2>/dev/null || true
 sleep 0.5
 
-chmod 666 /dev/null /dev/zero /dev/urandom /dev/tty /dev/ptmx /dev/input/event4 2>/dev/null || true
+chmod 666 /dev/null /dev/zero /dev/urandom /dev/tty /dev/ptmx /dev/input/event4 /dev/video* /dev/ion 2>/dev/null || true
 mkdir -p /dev/shm/xfb
 chmod 777 /dev/shm/xfb
-if [ "$1" = "dikey" ] || [ "$1" = "portrait" ]; then
+
+case "${1:-4k}" in
+  dikey|portrait)
     RES="1080x2400x24"
     CW=1080; CH=2200
-else
+    ;;
+  yatay|landscape)
     RES="2400x1080x24"
-    CW=2400; CH=960
-fi
+    CW=2400; CH=980
+    ;;
+  1080p|fhd)
+    RES="1920x1080x24"
+    CW=1920; CH=980
+    ;;
+  4k|uhd|*)
+    RES="3840x2160x24"
+    CW=3840; CH=2040
+    ;;
+esac
+
 Xvfb :0 -screen 0 "$RES" -fbdir /dev/shm/xfb >/var/log/xvfb0.log 2>&1 &
 for i in $(seq 1 30); do [ -f /dev/shm/xfb/Xvfb_screen0 ] && break; sleep 0.1; done
 
@@ -25,7 +40,4 @@ sleep 0.6
 
 su - ubuntu -c "DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS= nohup dbus-launch --exit-with-session startxfce4 >/tmp/xfce.log 2>&1 &"
 sleep 3
-su - ubuntu -c "DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage --window-size=${CW},${CH} --window-position=0,28 --user-data-dir=/home/ubuntu/.config/chr_xfce https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &"
-
-pkill -f "/opt/chrome_stream/xfce_server.py" 2>/dev/null || true
-pkill -f "/opt/chrome_stream/server.py" 2>/dev/null || true
+su - ubuntu -c "DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage --new-window --window-size=${CW},${CH} --window-position=0,28 --user-data-dir=/home/ubuntu/.config/chr_xfce https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &"

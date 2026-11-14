@@ -16,7 +16,6 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <linux/videodev2.h>
@@ -26,12 +25,9 @@
 #define FB_H 2400
 #define FB_STRIDE_PX 1088
 #define XWD_PATH "/dev/shm/xfb/Xvfb_screen0"
-#define XFCE_SOCK "/tmp/xfce_hwjpeg.sock"
-#define XFCE_SHM_JPG "/dev/shm/xfce_hw.jpg"
 #define UDP_PORT 9900
-#define UDP_CHUNK_PAYLOAD 1360
+#define UDP_CHUNK_PAYLOAD 1352
 
-/* MediaTek Android ION ioctl (MTK 4.14) */
 struct mtk_ion_alloc_data { size_t len; size_t align; unsigned int heap_id_mask; unsigned int flags; int handle; };
 struct mtk_ion_fd_data    { int handle; int fd; };
 struct mtk_ion_handle_data{ int handle; };
@@ -40,7 +36,6 @@ struct mtk_ion_handle_data{ int handle; };
 #define ION_IOC_SHARE _IOWR('I', 4, struct mtk_ion_fd_data)
 #define ION_HEAP_MULTIMEDIA_MASK (1u << 10)
 
-/* Binary-compatible XFixesCursorImage (LP64 aarch64) */
 typedef struct {
     short x, y;
     unsigned short width, height;
@@ -51,38 +46,40 @@ typedef struct {
 
 #pragma pack(push, 1)
 typedef struct {
-    char magic[4];      /* "AGTU" */
+    char magic[4];      /* "AGTT" */
     uint32_t frame_id;
     uint32_t total_size;
     uint16_t chunk_idx;
     uint16_t chunk_cnt;
-} udp_chunk_hdr_t;
+    uint16_t tx;
+    uint16_t ty;
+    uint16_t full_w;
+    uint16_t full_h;
+} udp_tile_hdr_t;
 #pragma pack(pop)
 
 static volatile int g_running = 1;
-static volatile int g_screen_on = 1;
+static volatile int g_screen_on = 0;
+static int g_fb_mirror = 0;
 static int g_landscape = 1;
-static int g_xv_w = 2400;
-static int g_xv_h = 1080;
+static int g_xv_w = 3840;
+static int g_xv_h = 2160;
+static int g_tiles_x = 2;
+static int g_tiles_y = 2;
 
 static pthread_mutex_t g_scr_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_enc_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_enc_cv = PTHREAD_COND_INITIALIZER;
 static uint32_t *g_enc_buf = NULL;
-static int g_enc_ready = 0;
+static volatile uint8_t g_tile_dirty[4] = {0, 0, 0, 0};
 
-static pthread_mutex_t g_cli_mu = PTHREAD_MUTEX_INITIALIZER;
-static int g_srv_fd = -1;
-static int g_cli_fd = -1;
-static volatile int g_force_frame = 0;
-
-/* UDP state */
 static int g_udp_fd = -1;
 static pthread_mutex_t g_udp_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct sockaddr_in g_udp_cli;
 static int g_udp_has_cli = 0;
 static uint64_t g_udp_last_hello_ms = 0;
 static uint32_t g_udp_frame_id = 0;
+static volatile int g_force_all = 0;
 
 static inline uint64_t now_ms(void) {
     struct timespec ts;
@@ -151,24 +148,22 @@ static void *fifo_thread(void *arg) {
 }
 
 static void map_touch(int raw_x_px, int raw_y_px, int *out_x, int *out_y) {
-    if (g_landscape) {
-        int vx = (FB_H - 1) - raw_y_px;
-        int vy = raw_x_px;
-        if (vx < 0) vx = 0;
-        if (vx >= FB_H) vx = FB_H - 1;
-        if (vy < 0) vy = 0;
-        if (vy >= FB_W) vy = FB_W - 1;
-        *out_x = vx;
-        *out_y = vy;
+    int vx, vy;
+    if (g_fb_mirror && !g_landscape) {
+        vx = raw_x_px; vy = raw_y_px;
+    } else if (g_fb_mirror && g_landscape) {
+        vx = (FB_H - 1) - raw_y_px;
+        vy = raw_x_px;
     } else {
-        int vx = raw_x_px, vy = raw_y_px;
-        if (vx < 0) vx = 0;
-        if (vx >= FB_W) vx = FB_W - 1;
-        if (vy < 0) vy = 0;
-        if (vy >= FB_H) vy = FB_H - 1;
-        *out_x = vx;
-        *out_y = vy;
+        vx = ((FB_H - 1) - raw_y_px) * g_xv_w / FB_H;
+        vy = raw_x_px * g_xv_h / FB_W;
     }
+    if (vx < 0) vx = 0;
+    if (vx >= g_xv_w) vx = g_xv_w - 1;
+    if (vy < 0) vy = 0;
+    if (vy >= g_xv_h) vy = g_xv_h - 1;
+    *out_x = vx;
+    *out_y = vy;
 }
 
 static void *touch_thread(void *arg) {
@@ -248,15 +243,14 @@ static void *touch_thread(void *arg) {
     return NULL;
 }
 
-/* --- Direct C UDP Input Receiver (0-copy latency for mouse/drag/keyboard/Turkish) --- */
 typedef struct { uint32_t cp; uint32_t kc; int shift; } tr_slot_t;
 static const struct { uint32_t kc; unsigned long lo; unsigned long hi; } g_tr_map[6] = {
-    { 154, 0x01ba, 0x01aa }, /* ş Ş */
-    { 168, 0x02bb, 0x02ab }, /* ğ Ğ */
-    { 178, 0x00fc, 0x00dc }, /* ü Ü */
-    { 183, 0x02b9, 0x02a9 }, /* ı İ */
-    { 184, 0x00f6, 0x00d6 }, /* ö Ö */
-    { 197, 0x00e7, 0x00c7 }, /* ç Ç */
+    { 154, 0x01ba, 0x01aa },
+    { 168, 0x02bb, 0x02ab },
+    { 178, 0x00fc, 0x00dc },
+    { 183, 0x02b9, 0x02a9 },
+    { 184, 0x00f6, 0x00d6 },
+    { 197, 0x00e7, 0x00c7 },
 };
 static const tr_slot_t g_tr_cp[12] = {
     { 0x015f, 154, 0 }, { 0x015e, 154, 1 },
@@ -338,14 +332,16 @@ static void *udp_rx_thread(void *arg) {
         if (n < 4) { usleep(5000); continue; }
 
         if (memcmp(buf, "AGTH", 4) == 0) {
+            int first_or_new = 0;
             pthread_mutex_lock(&g_udp_mu);
+            if (!g_udp_has_cli || g_udp_cli.sin_addr.s_addr != from.sin_addr.s_addr || g_udp_cli.sin_port != from.sin_port)
+                first_or_new = 1;
             g_udp_cli = from;
             g_udp_has_cli = 1;
             g_udp_last_hello_ms = now_ms();
-            g_force_frame = 1;
+            if (first_or_new) g_force_all = 1;
             pthread_mutex_unlock(&g_udp_mu);
 
-            /* Reply AGTS + width(u16) + height(u16) + screen_on(u8) */
             uint8_t ack[9];
             memcpy(ack, "AGTS", 4);
             ack[4] = (uint8_t)(g_xv_w & 0xff); ack[5] = (uint8_t)((g_xv_w >> 8) & 0xff);
@@ -358,19 +354,21 @@ static void *udp_rx_thread(void *arg) {
         if (memcmp(buf, "AGTI", 4) != 0 || n < 5) continue;
         uint8_t kind = buf[4];
 
-        if (kind == 1 && n >= 11) { /* MOUSE: action(1), button(1), x(i16), y(i16) */
+        if (kind == 1 && n >= 11) {
             uint8_t act = buf[5];
             uint8_t btn = buf[6];
             int16_t mx = (int16_t)(buf[7] | (buf[8] << 8));
             int16_t my = (int16_t)(buf[9] | (buf[10] << 8));
-            if (mx < 0) mx = 0; if (mx >= g_xv_w) mx = (int16_t)(g_xv_w - 1);
-            if (my < 0) my = 0; if (my >= g_xv_h) my = (int16_t)(g_xv_h - 1);
+            if (mx < 0) mx = 0;
+            if (mx >= g_xv_w) mx = (int16_t)(g_xv_w - 1);
+            if (my < 0) my = 0;
+            if (my >= g_xv_h) my = (int16_t)(g_xv_h - 1);
             pXTestMotion(dpy, -1, mx, my, 0);
             if (act == 1) pXTestBtn(dpy, btn, 1, 0);
             else if (act == 2) pXTestBtn(dpy, btn, 0, 0);
             else if (act == 3) { pXTestBtn(dpy, btn, 1, 0); pXTestBtn(dpy, btn, 0, 0); }
             pXFlush(dpy);
-        } else if (kind == 2 && n >= 10) { /* KEY: mods(1), keysym(u32) */
+        } else if (kind == 2 && n >= 10) {
             uint8_t mods = buf[5];
             uint32_t ks = (uint32_t)buf[6] | ((uint32_t)buf[7] << 8) | ((uint32_t)buf[8] << 16) | ((uint32_t)buf[9] << 24);
             unsigned int kc = pXKeysymToKeycode(dpy, (unsigned long)ks);
@@ -387,7 +385,7 @@ static void *udp_rx_thread(void *arg) {
                 if ((mods & 1) && kc_ctrl)  pXTestKey(dpy, kc_ctrl, 0, 0);
                 pXFlush(dpy);
             }
-        } else if (kind == 3 && n >= 7) { /* UTF-8 TEXT: len(u16) + bytes */
+        } else if (kind == 3 && n >= 7) {
             uint16_t tlen = (uint16_t)(buf[5] | (buf[6] << 8));
             if (7 + tlen > n) tlen = (uint16_t)(n - 7);
             size_t i = 0;
@@ -423,7 +421,7 @@ static void *udp_rx_thread(void *arg) {
                 }
             }
             pXFlush(dpy);
-        } else if (kind == 4 && n >= 6) { /* CMD */
+        } else if (kind == 4 && n >= 6) {
             uint8_t cmd = buf[5];
             if (cmd == 4) {
                 set_screen(!g_screen_on);
@@ -442,13 +440,16 @@ static void *udp_rx_thread(void *arg) {
                 int r = system("/usr/local/bin/ekran xfce yatay &"); (void)r;
             } else if (cmd == 6) {
                 int r = system("/usr/local/bin/ekran xfce dikey &"); (void)r;
+            } else if (cmd == 7) {
+                int r = system("/usr/local/bin/ekran xfce 4k &"); (void)r;
+            } else if (cmd == 8) {
+                int r = system("/usr/local/bin/ekran xfce 1080p &"); (void)r;
             }
         }
     }
     return NULL;
 }
 
-/* Blend XFixes ARGB cursor onto BGRX frame buffer */
 static void overlay_cursor(uint32_t *buf, int w, int h, const my_XFixesCursorImage *ci) {
     if (!ci || !ci->pixels || ci->width == 0 || ci->height == 0) return;
     int ox = (int)ci->x - (int)ci->xhot;
@@ -479,7 +480,7 @@ static void overlay_cursor(uint32_t *buf, int w, int h, const my_XFixesCursorIma
     }
 }
 
-static void bgrx_to_yuyv_neon(const uint8_t *src, uint8_t *dst, int w, int h) {
+static void bgrx_to_yuyv_neon_rect(const uint32_t *full_buf, int full_w, int tx, int ty, int tw, int th, uint8_t *dst) {
     const uint8x8_t k66  = vdup_n_u8(66);
     const uint8x8_t k129 = vdup_n_u8(129);
     const uint8x8_t k25  = vdup_n_u8(25);
@@ -489,11 +490,11 @@ static void bgrx_to_yuyv_neon(const uint8_t *src, uint8_t *dst, int w, int h) {
     const int16x8_t km94 = vdupq_n_s16(-94);
     const int16x8_t km18 = vdupq_n_s16(-18);
 
-    for (int y = 0; y < h; y++) {
-        const uint8_t *s = src + (size_t)y * w * 4;
-        uint8_t *d = dst + (size_t)y * w * 2;
+    for (int y = 0; y < th; y++) {
+        const uint8_t *s = (const uint8_t *)(full_buf + (size_t)(ty + y) * full_w + tx);
+        uint8_t *d = dst + (size_t)y * tw * 2;
         int x = 0;
-        for (; x + 8 <= w; x += 8) {
+        for (; x + 8 <= tw; x += 8) {
             uint8x8x4_t bgrx = vld4_u8(s);
             uint16x8_t y16 = vmull_u8(bgrx.val[2], k66);
             y16 = vmlal_u8(y16, bgrx.val[1], k129);
@@ -516,19 +517,17 @@ static void bgrx_to_yuyv_neon(const uint8_t *src, uint8_t *dst, int w, int h) {
             uint8x8_t V = vqmovun_s16(vaddq_s16(vshrq_n_s16(v16, 8), vdupq_n_s16(128)));
 
             uint8x8x2_t y_pairs = vtrn_u8(Y, Y);
-            uint8x8_t y_even = y_pairs.val[0];
-            uint8x8_t y_odd  = y_pairs.val[1];
             uint8x8x4_t out;
-            out.val[0] = vuzp1_u8(y_even, y_even);
+            out.val[0] = vuzp1_u8(y_pairs.val[0], y_pairs.val[0]);
             out.val[1] = vuzp1_u8(U, U);
-            out.val[2] = vuzp1_u8(y_odd, y_odd);
+            out.val[2] = vuzp1_u8(y_pairs.val[1], y_pairs.val[1]);
             out.val[3] = vuzp1_u8(V, V);
             uint8_t tmp[32];
             vst4_u8(tmp, out);
             memcpy(d, tmp, 16);
             s += 32; d += 16;
         }
-        for (; x < w; x += 2) {
+        for (; x < tw; x += 2) {
             int b0 = s[0], g0 = s[1], r0 = s[2];
             int b1 = s[4], g1 = s[5], r1 = s[6];
             int y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16;
@@ -549,6 +548,7 @@ typedef struct {
     int in_h, in_fd, cap_h, cap_fd;
     uint8_t *in_map, *cap_map;
     size_t in_size, cap_size;
+    int tw, th;
 } hwjpeg_ctx;
 
 static int ion_alloc_buf(int ion_fd, size_t sz, int *out_h, int *out_fd, uint8_t **out_map) {
@@ -562,35 +562,36 @@ static int ion_alloc_buf(int ion_fd, size_t sz, int *out_h, int *out_fd, uint8_t
     return 0;
 }
 
-static int hwjpeg_init(hwjpeg_ctx *c, int w, int h) {
+static int hwjpeg_init(hwjpeg_ctx *c, int tw, int th) {
     memset(c, 0, sizeof(*c));
+    c->tw = tw; c->th = th;
     c->ion_fd = open("/dev/ion", O_RDWR);
     c->vfd = open("/dev/video4", O_RDWR);
     if (c->ion_fd < 0 || c->vfd < 0) return -1;
 
-    struct v4l2_control ctrl = { .id = V4L2_CID_JPEG_COMPRESSION_QUALITY, .value = 88 };
+    struct v4l2_control ctrl = { .id = V4L2_CID_JPEG_COMPRESSION_QUALITY, .value = 82 };
     ioctl(c->vfd, VIDIOC_S_CTRL, &ctrl);
 
     struct v4l2_format f_out = {0};
     f_out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    f_out.fmt.pix_mp.width = w;
-    f_out.fmt.pix_mp.height = h;
+    f_out.fmt.pix_mp.width = tw;
+    f_out.fmt.pix_mp.height = th;
     f_out.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUYV;
     f_out.fmt.pix_mp.num_planes = 1;
-    f_out.fmt.pix_mp.plane_fmt[0].bytesperline = w * 2;
-    f_out.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)(w * h * 2);
+    f_out.fmt.pix_mp.plane_fmt[0].bytesperline = tw * 2;
+    f_out.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)(tw * th * 2);
     if (ioctl(c->vfd, VIDIOC_S_FMT, &f_out) < 0) return -2;
-    c->in_size = f_out.fmt.pix_mp.plane_fmt[0].sizeimage ? f_out.fmt.pix_mp.plane_fmt[0].sizeimage : (size_t)w * h * 2;
+    c->in_size = f_out.fmt.pix_mp.plane_fmt[0].sizeimage ? f_out.fmt.pix_mp.plane_fmt[0].sizeimage : (size_t)tw * th * 2;
 
     struct v4l2_format f_cap = {0};
     f_cap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    f_cap.fmt.pix_mp.width = w;
-    f_cap.fmt.pix_mp.height = h;
+    f_cap.fmt.pix_mp.width = tw;
+    f_cap.fmt.pix_mp.height = th;
     f_cap.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_JPEG;
     f_cap.fmt.pix_mp.num_planes = 1;
-    f_cap.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)(w * h * 2);
+    f_cap.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)(tw * th * 2);
     if (ioctl(c->vfd, VIDIOC_S_FMT, &f_cap) < 0) return -3;
-    c->cap_size = f_cap.fmt.pix_mp.plane_fmt[0].sizeimage ? f_cap.fmt.pix_mp.plane_fmt[0].sizeimage : (size_t)w * h * 2;
+    c->cap_size = f_cap.fmt.pix_mp.plane_fmt[0].sizeimage ? f_cap.fmt.pix_mp.plane_fmt[0].sizeimage : (size_t)tw * th * 2;
 
     if (ion_alloc_buf(c->ion_fd, c->in_size, &c->in_h, &c->in_fd, &c->in_map) < 0) return -4;
     if (ion_alloc_buf(c->ion_fd, c->cap_size, &c->cap_h, &c->cap_fd, &c->cap_map) < 0) return -5;
@@ -606,11 +607,11 @@ static int hwjpeg_init(hwjpeg_ctx *c, int w, int h) {
     return 0;
 }
 
-static ssize_t hwjpeg_encode(hwjpeg_ctx *c, const uint32_t *bgrx, int w, int h) {
-    bgrx_to_yuyv_neon((const uint8_t *)bgrx, c->in_map, w, h);
+static ssize_t hwjpeg_encode_tile(hwjpeg_ctx *c, const uint32_t *full_buf, int full_w, int tx, int ty) {
+    bgrx_to_yuyv_neon_rect(full_buf, full_w, tx, ty, c->tw, c->th, c->in_map);
 
     struct v4l2_plane po = {0}, pc = {0};
-    po.m.fd = c->in_fd; po.length = (uint32_t)c->in_size; po.bytesused = (uint32_t)(w * h * 2);
+    po.m.fd = c->in_fd; po.length = (uint32_t)c->in_size; po.bytesused = (uint32_t)(c->tw * c->th * 2);
     pc.m.fd = c->cap_fd; pc.length = (uint32_t)c->cap_size;
 
     struct v4l2_buffer bo = {0}, bc = {0};
@@ -622,100 +623,94 @@ static ssize_t hwjpeg_encode(hwjpeg_ctx *c, const uint32_t *bgrx, int w, int h) 
 
     if (ioctl(c->vfd, VIDIOC_DQBUF, &bc) < 0) return -3;
     if (ioctl(c->vfd, VIDIOC_DQBUF, &bo) < 0) return -4;
-    return (ssize_t)bc.m.planes[0].bytesused;
+    uint32_t used = bc.m.planes[0].bytesused;
+    if (used == 0 || used >= c->cap_size) return -5;
+    return (ssize_t)used;
 }
 
-static void *accept_thread(void *arg) {
-    (void)arg;
-    unlink(XFCE_SOCK);
-    g_srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un sa = {0};
-    sa.sun_family = AF_UNIX;
-    strncpy(sa.sun_path, XFCE_SOCK, sizeof(sa.sun_path) - 1);
-    if (bind(g_srv_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) return NULL;
-    chmod(XFCE_SOCK, 0666);
-    listen(g_srv_fd, 4);
-
-    while (g_running) {
-        int cfd = accept(g_srv_fd, NULL, NULL);
-        if (cfd < 0) { usleep(100000); continue; }
-        pthread_mutex_lock(&g_cli_mu);
-        if (g_cli_fd >= 0) close(g_cli_fd);
-        g_cli_fd = cfd;
-        g_force_frame = 1;
-        pthread_mutex_unlock(&g_cli_mu);
-    }
-    return NULL;
-}
-
-static void send_frame(const uint8_t *jpg, uint32_t len) {
-    int fd_shm = open(XFCE_SHM_JPG ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_shm >= 0) {
-        ssize_t w = write(fd_shm, jpg, len);
-        (void)w;
-        close(fd_shm);
-        rename(XFCE_SHM_JPG ".tmp", XFCE_SHM_JPG);
-    }
-
-    pthread_mutex_lock(&g_cli_mu);
-    if (g_cli_fd >= 0) {
-        uint8_t hdr[4] = { len & 0xff, (len >> 8) & 0xff, (len >> 16) & 0xff, (len >> 24) & 0xff };
-        if (send(g_cli_fd, hdr, 4, MSG_NOSIGNAL) != 4 ||
-            send(g_cli_fd, jpg, len, MSG_NOSIGNAL) != (ssize_t)len) {
-            close(g_cli_fd);
-            g_cli_fd = -1;
-        }
-    }
-    pthread_mutex_unlock(&g_cli_mu);
-
-    /* Direct zero-broker UDP chunked frame blast */
+static void send_tile_udp(const uint8_t *jpg, uint32_t len, uint16_t tx, uint16_t ty) {
     pthread_mutex_lock(&g_udp_mu);
     int has_u = (g_udp_has_cli && g_udp_fd >= 0 && (now_ms() - g_udp_last_hello_ms <= 10000));
     struct sockaddr_in ucli = g_udp_cli;
     if (!has_u) g_udp_has_cli = 0;
     pthread_mutex_unlock(&g_udp_mu);
+    if (!has_u) return;
 
-    if (has_u) {
-        uint32_t fid = ++g_udp_frame_id;
-        uint16_t cnt = (uint16_t)((len + UDP_CHUNK_PAYLOAD - 1) / UDP_CHUNK_PAYLOAD);
-        uint8_t pkt[sizeof(udp_chunk_hdr_t) + UDP_CHUNK_PAYLOAD];
-        for (uint16_t idx = 0; idx < cnt; idx++) {
-            uint32_t off = (uint32_t)idx * UDP_CHUNK_PAYLOAD;
-            uint32_t plen = len - off;
-            if (plen > UDP_CHUNK_PAYLOAD) plen = UDP_CHUNK_PAYLOAD;
-            udp_chunk_hdr_t *h = (udp_chunk_hdr_t *)pkt;
-            memcpy(h->magic, "AGTU", 4);
-            h->frame_id = fid;
-            h->total_size = len;
-            h->chunk_idx = idx;
-            h->chunk_cnt = cnt;
-            memcpy(pkt + sizeof(*h), jpg + off, plen);
-            sendto(g_udp_fd, pkt, sizeof(*h) + plen, 0, (struct sockaddr *)&ucli, sizeof(ucli));
-        }
+    uint32_t fid = ++g_udp_frame_id;
+    uint16_t cnt = (uint16_t)((len + UDP_CHUNK_PAYLOAD - 1) / UDP_CHUNK_PAYLOAD);
+    uint8_t pkt[sizeof(udp_tile_hdr_t) + UDP_CHUNK_PAYLOAD];
+    for (uint16_t idx = 0; idx < cnt; idx++) {
+        uint32_t off = (uint32_t)idx * UDP_CHUNK_PAYLOAD;
+        uint32_t plen = len - off;
+        if (plen > UDP_CHUNK_PAYLOAD) plen = UDP_CHUNK_PAYLOAD;
+        udp_tile_hdr_t *h = (udp_tile_hdr_t *)pkt;
+        memcpy(h->magic, "AGTT", 4);
+        h->frame_id = fid;
+        h->total_size = len;
+        h->chunk_idx = idx;
+        h->chunk_cnt = cnt;
+        h->tx = tx;
+        h->ty = ty;
+        h->full_w = (uint16_t)g_xv_w;
+        h->full_h = (uint16_t)g_xv_h;
+        memcpy(pkt + sizeof(*h), jpg + off, plen);
+        sendto(g_udp_fd, pkt, sizeof(*h) + plen, 0, (struct sockaddr *)&ucli, sizeof(ucli));
+        if ((idx & 15) == 15) usleep(50);
     }
 }
 
 static void *enc_thread(void *arg) {
     (void)arg;
+    int tw = g_xv_w / g_tiles_x;
+    int th = g_xv_h / g_tiles_y;
     hwjpeg_ctx ctx;
-    if (hwjpeg_init(&ctx, g_xv_w, g_xv_h) < 0) {
-        fprintf(stderr, "fb_xfce_bridge: /dev/video4 hwjpeg_init failed\n");
+    if (hwjpeg_init(&ctx, tw, th) < 0) {
+        fprintf(stderr, "fb_xfce_bridge: /dev/video4 hwjpeg_init(%dx%d tile) failed\n", tw, th);
         return NULL;
     }
-    uint32_t *local = malloc((size_t)g_xv_w * g_xv_h * 4);
+    size_t fb_sz = (size_t)g_xv_w * g_xv_h * 4;
+    uint32_t *local = malloc(fb_sz);
+    int ntiles = g_tiles_x * g_tiles_y;
+
     while (g_running) {
+        uint8_t dirty[4] = {0, 0, 0, 0};
         pthread_mutex_lock(&g_enc_mu);
-        while (g_running && !g_enc_ready) pthread_cond_wait(&g_enc_cv, &g_enc_mu);
+        while (g_running) {
+            int any = 0;
+            for (int t = 0; t < ntiles; t++) if (g_tile_dirty[t]) any = 1;
+            if (any) break;
+            pthread_cond_wait(&g_enc_cv, &g_enc_mu);
+        }
         if (!g_running) { pthread_mutex_unlock(&g_enc_mu); break; }
-        memcpy(local, g_enc_buf, (size_t)g_xv_w * g_xv_h * 4);
-        g_enc_ready = 0;
+        memcpy(local, g_enc_buf, fb_sz);
+        for (int t = 0; t < ntiles; t++) {
+            dirty[t] = g_tile_dirty[t];
+            g_tile_dirty[t] = 0;
+        }
         pthread_mutex_unlock(&g_enc_mu);
 
-        ssize_t jsz = hwjpeg_encode(&ctx, local, g_xv_w, g_xv_h);
-        if (jsz > 0) send_frame(ctx.cap_map, (uint32_t)jsz);
+        for (int ty_i = 0; ty_i < g_tiles_y; ty_i++) {
+            for (int tx_i = 0; tx_i < g_tiles_x; tx_i++) {
+                int idx = ty_i * g_tiles_x + tx_i;
+                if (!dirty[idx]) continue;
+                int px = tx_i * tw, py = ty_i * th;
+                ssize_t jsz = hwjpeg_encode_tile(&ctx, local, g_xv_w, px, py);
+                if (jsz > 0) send_tile_udp(ctx.cap_map, (uint32_t)jsz, (uint16_t)px, (uint16_t)py);
+                if (ntiles > 1) usleep(2500);
+            }
+        }
     }
     free(local);
     return NULL;
+}
+
+static int tile_changed(const uint32_t *a, const uint32_t *b, int full_w, int tx, int ty, int tw, int th) {
+    size_t row_bytes = (size_t)tw * 4;
+    for (int y = 0; y < th; y++) {
+        size_t off = (size_t)(ty + y) * full_w + tx;
+        if (memcmp(a + off, b + off, row_bytes) != 0) return 1;
+    }
+    return 0;
 }
 
 static void on_sig(int s) { (void)s; g_running = 0; pthread_cond_broadcast(&g_enc_cv); }
@@ -747,27 +742,46 @@ int main(int argc, char **argv) {
     g_xv_w = (int)read_be32(xmap + 16);
     g_xv_h = (int)read_be32(xmap + 20);
     uint32_t ncolors = read_be32(xmap + 76);
-    g_landscape = (g_xv_w == FB_H && g_xv_h == FB_W) ? 1 : 0;
+
+    if (g_xv_w > 2560) { g_tiles_x = 2; g_tiles_y = 2; }
+    else               { g_tiles_x = 1; g_tiles_y = 1; }
+
+    if (g_xv_w == FB_W && g_xv_h == FB_H) {
+        g_fb_mirror = 1; g_landscape = 0;
+    } else if (g_xv_w == FB_H && g_xv_h == FB_W) {
+        g_fb_mirror = 1; g_landscape = 1;
+    } else {
+        g_fb_mirror = 0; g_landscape = 1;
+    }
 
     size_t pix_off = hdr_sz + ncolors * 12;
     const uint32_t *src = (const uint32_t *)(xmap + pix_off);
+    size_t frame_bytes = (size_t)g_xv_w * g_xv_h * 4;
 
-    int fbfd = open("/dev/fb0", O_RDWR);
-    if (fbfd < 0) { perror("open /dev/fb0"); return 3; }
-
-    size_t fb_bytes = (size_t)FB_STRIDE_PX * FB_H * 4;
-    uint32_t *fb_map = mmap(NULL, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
-    uint32_t *prev_raw = calloc((size_t)FB_W * FB_H, 4);
-    uint32_t *composed = malloc((size_t)g_xv_w * g_xv_h * 4);
-    g_enc_buf = malloc((size_t)g_xv_w * g_xv_h * 4);
-
+    int fbfd = -1;
+    uint32_t *fb_map = MAP_FAILED;
     struct fb_var_screeninfo vinfo;
-    ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
+    size_t fb_bytes = (size_t)FB_STRIDE_PX * FB_H * 4;
 
-    /* Open UDP port 9900 with large kernel buffers */
+    if (g_fb_mirror) {
+        fbfd = open("/dev/fb0", O_RDWR);
+        if (fbfd >= 0) {
+            fb_map = mmap(NULL, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
+            ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
+        }
+        set_screen(1);
+    } else {
+        set_screen(0);
+    }
+
+    uint32_t *prev_raw = calloc(1, frame_bytes);
+    uint32_t *prev_comp = calloc(1, frame_bytes);
+    uint32_t *composed = malloc(frame_bytes);
+    g_enc_buf = malloc(frame_bytes);
+
     g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_udp_fd >= 0) {
-        int sb = 4 * 1024 * 1024, rb = 1 * 1024 * 1024;
+        int sb = 8 * 1024 * 1024, rb = 1 * 1024 * 1024;
         setsockopt(g_udp_fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
         setsockopt(g_udp_fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
         struct sockaddr_in bind_addr = {0};
@@ -781,7 +795,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Load X11 + XFixes to read real cursor shape & position */
     void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
     int (*pXInitThreads)(void) = hx11 ? dlsym(hx11, "XInitThreads") : NULL;
     if (pXInitThreads) pXInitThreads();
@@ -791,36 +804,37 @@ int main(int argc, char **argv) {
     my_XFixesCursorImage *(*pGetCursor)(void *) = hxfix ? dlsym(hxfix, "XFixesGetCursorImage") : NULL;
     void *cur_dpy = pXOpenDisplay ? pXOpenDisplay(disp) : NULL;
 
-    set_screen(1);
-
-    pthread_t th_pwr, th_fifo, th_tch, th_acc, th_enc, th_urx;
+    pthread_t th_pwr, th_fifo, th_tch, th_enc, th_urx;
     pthread_create(&th_pwr, NULL, power_thread, NULL);
     pthread_create(&th_fifo, NULL, fifo_thread, NULL);
     pthread_create(&th_tch, NULL, touch_thread, (void *)disp);
-    pthread_create(&th_acc, NULL, accept_thread, NULL);
     pthread_create(&th_enc, NULL, enc_thread, NULL);
     if (g_udp_fd >= 0) pthread_create(&th_urx, NULL, udp_rx_thread, (void *)disp);
 
     uint64_t last_enc_ms = 0;
     int prev_cx = -999, prev_cy = -999;
     unsigned long prev_serial = 0;
+    int tw = g_xv_w / g_tiles_x;
+    int th = g_xv_h / g_tiles_y;
+    int ntiles = g_tiles_x * g_tiles_y;
+    int hb_tile = 0;
 
     while (g_running) {
         uint64_t t = now_ms();
-        int has_cli = (g_cli_fd >= 0 || (g_udp_has_cli && t - g_udp_last_hello_ms <= 10000));
-        int fb_changed = (memcmp(src, prev_raw, (size_t)FB_W * FB_H * 4) != 0);
+        int has_cli = (g_udp_has_cli && t - g_udp_last_hello_ms <= 10000);
+        int fb_changed = (memcmp(src, prev_raw, frame_bytes) != 0);
         my_XFixesCursorImage *ci = (cur_dpy && pGetCursor) ? pGetCursor(cur_dpy) : NULL;
         int cur_changed = (ci && (ci->x != prev_cx || ci->y != prev_cy || ci->cursor_serial != prev_serial));
-        int need_hb = (g_force_frame || (has_cli && t - last_enc_ms >= 500));
+        int need_hb = (g_force_all || (has_cli && t - last_enc_ms >= 250));
 
         if (fb_changed || cur_changed || need_hb) {
-            if (fb_changed) memcpy(prev_raw, src, (size_t)FB_W * FB_H * 4);
+            if (fb_changed) memcpy(prev_raw, src, frame_bytes);
             if (ci) { prev_cx = ci->x; prev_cy = ci->y; prev_serial = ci->cursor_serial; }
 
-            memcpy(composed, prev_raw, (size_t)g_xv_w * g_xv_h * 4);
+            memcpy(composed, prev_raw, frame_bytes);
             if (ci) overlay_cursor(composed, g_xv_w, g_xv_h, ci);
 
-            if ((fb_changed || cur_changed) && g_screen_on && fb_map != MAP_FAILED) {
+            if (g_fb_mirror && (fb_changed || cur_changed) && g_screen_on && fb_map != MAP_FAILED) {
                 if (!g_landscape) {
                     for (int y = 0; y < FB_H; y++) {
                         const uint32_t *srow = composed + y * FB_W;
@@ -845,30 +859,49 @@ int main(int argc, char **argv) {
                 ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
             }
 
-            if (need_hb || (has_cli && t - last_enc_ms >= 22) || (t - last_enc_ms >= 400)) {
-                g_force_frame = 0;
-                last_enc_ms = t;
-                pthread_mutex_lock(&g_enc_mu);
-                memcpy(g_enc_buf, composed, (size_t)g_xv_w * g_xv_h * 4);
-                g_enc_ready = 1;
-                pthread_cond_signal(&g_enc_cv);
-                pthread_mutex_unlock(&g_enc_mu);
+            if (has_cli && (need_hb || t - last_enc_ms >= 18)) {
+                uint8_t dirty[4] = {0, 0, 0, 0};
+                int any = 0;
+                if (g_force_all) {
+                    for (int k = 0; k < ntiles; k++) dirty[k] = 1;
+                    any = 1;
+                    g_force_all = 0;
+                } else {
+                    for (int ty_i = 0; ty_i < g_tiles_y; ty_i++) {
+                        for (int tx_i = 0; tx_i < g_tiles_x; tx_i++) {
+                            int k = ty_i * g_tiles_x + tx_i;
+                            if (tile_changed(composed, prev_comp, g_xv_w, tx_i * tw, ty_i * th, tw, th)) {
+                                dirty[k] = 1; any = 1;
+                            }
+                        }
+                    }
+                    if (!any && need_hb) { dirty[hb_tile] = 1; hb_tile = (hb_tile + 1) % ntiles; any = 1; }
+                }
+
+                if (any) {
+                    memcpy(prev_comp, composed, frame_bytes);
+                    last_enc_ms = t;
+                    pthread_mutex_lock(&g_enc_mu);
+                    memcpy(g_enc_buf, composed, frame_bytes);
+                    for (int k = 0; k < ntiles; k++) if (dirty[k]) g_tile_dirty[k] = 1;
+                    pthread_cond_signal(&g_enc_cv);
+                    pthread_mutex_unlock(&g_enc_mu);
+                }
             }
         }
         if (ci && pXFree) pXFree(ci);
-        usleep(16000);
+        usleep(14000);
     }
 
-    set_screen(0);
+    if (g_fb_mirror) set_screen(0);
     if (g_udp_fd >= 0) close(g_udp_fd);
-    if (g_srv_fd >= 0) close(g_srv_fd);
-    unlink(XFCE_SOCK);
     free(prev_raw);
+    free(prev_comp);
     free(composed);
     free(g_enc_buf);
     munmap(xmap, st.st_size);
     if (fb_map != MAP_FAILED) munmap(fb_map, fb_bytes);
-    close(fbfd);
+    if (fbfd >= 0) close(fbfd);
     close(xfd);
     return 0;
 }

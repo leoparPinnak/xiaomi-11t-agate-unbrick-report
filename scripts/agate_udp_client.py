@@ -43,7 +43,7 @@ QT_KEY_TO_KEYSYM = {
 
 
 class UdpSignals(QObject):
-    frame_ready = Signal(QImage)
+    tile_ready = Signal(int, int, int, int, QImage)  # tx, ty, full_w, full_h, tile_img
     stats_ready = Signal(int, int, float, int, int)  # fps, kbps, loss_pct, w, h
 
 
@@ -56,8 +56,8 @@ class UdpTransport:
         self.running = False
         self.rx_thread = None
         self.ka_thread = None
-        self.remote_w = 2400
-        self.remote_h = 1080
+        self.remote_w = 3840
+        self.remote_h = 2160
         self.fps_cnt = 0
         self.bytes_cnt = 0
         self.frames_seen = 0
@@ -68,7 +68,7 @@ class UdpTransport:
         self.host = host.strip()
         self.port = int(port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         self.sock.settimeout(0.25)
         self.running = True
         self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
@@ -138,8 +138,8 @@ class UdpTransport:
             time.sleep(0.5)
 
     def _rx_loop(self):
-        inflight = {}  # fid -> [cnt, total_sz, parts_dict, ts]
-        latest_completed_fid = 0
+        inflight = {}  # fid -> [cnt, total_sz, parts_dict, ts, tx, ty, fw, fh]
+        latest_tile_fid = {}  # (tx, ty) -> last completed fid
         seen_fids = set()
 
         while self.running and self.sock:
@@ -157,41 +157,47 @@ class UdpTransport:
                     self.remote_h = h
                 continue
 
-            if len(pkt) < 16 or pkt[:4] != b"AGTU":
+            if len(pkt) >= 24 and pkt[:4] == b"AGTT":
+                fid, total_sz, idx, cnt, tx, ty, fw, fh = struct.unpack("<IIHHHHHH", pkt[4:24])
+                hdr_len = 24
+            elif len(pkt) >= 16 and pkt[:4] == b"AGTU":
+                fid, total_sz, idx, cnt = struct.unpack("<IIHH", pkt[4:16])
+                tx, ty, fw, fh = 0, 0, self.remote_w, self.remote_h
+                hdr_len = 16
+            else:
                 continue
 
-            fid, total_sz, idx, cnt = struct.unpack("<IIHH", pkt[4:16])
-            if fid <= latest_completed_fid or cnt == 0 or idx >= cnt:
+            if fid <= latest_tile_fid.get((tx, ty), 0) or cnt == 0 or idx >= cnt:
                 continue
 
             if fid not in seen_fids:
                 seen_fids.add(fid)
                 self.frames_seen += 1
-                if len(seen_fids) > 128:
-                    seen_fids = {x for x in seen_fids if x >= fid - 64}
+                if len(seen_fids) > 256:
+                    seen_fids = {x for x in seen_fids if x >= fid - 128}
 
             entry = inflight.get(fid)
             if entry is None:
-                entry = [cnt, total_sz, {}, time.monotonic()]
+                entry = [cnt, total_sz, {}, time.monotonic(), tx, ty, fw, fh]
                 inflight[fid] = entry
 
-            entry[2][idx] = pkt[16:]
+            entry[2][idx] = pkt[hdr_len:]
             self.bytes_cnt += len(pkt)
 
             if len(entry[2]) == cnt:
-                latest_completed_fid = fid
+                latest_tile_fid[(entry[4], entry[5])] = fid
                 self.frames_ok += 1
                 self.fps_cnt += 1
                 jpg = b"".join(entry[2][i] for i in range(cnt))
-                # Discard older incomplete frames (no head-of-line blocking!)
-                for old_id in [k for k in inflight.keys() if k <= fid]:
-                    del inflight[old_id]
+                del inflight[fid]
                 img = QImage.fromData(jpg, "JPEG")
                 if not img.isNull():
-                    self.signals.frame_ready.emit(img)
-            elif len(inflight) > 6:
+                    if fw > 0 and fh > 0:
+                        self.remote_w, self.remote_h = fw, fh
+                    self.signals.tile_ready.emit(entry[4], entry[5], self.remote_w, self.remote_h, img)
+            elif len(inflight) > 12:
                 now = time.monotonic()
-                for old_id in [k for k, v in inflight.items() if now - v[3] > 0.25]:
+                for old_id in [k for k, v in inflight.items() if now - v[3] > 0.35]:
                     del inflight[old_id]
 
 
@@ -206,8 +212,13 @@ class ScreenCanvas(QWidget):
         self.last_move_ts = 0.0
         self.draw_rect = (0, 0, 1, 1)
 
-    def set_frame(self, img: QImage):
-        self.img = img
+    def set_tile(self, tx: int, ty: int, fw: int, fh: int, tile: QImage):
+        if self.img is None or self.img.width() != fw or self.img.height() != fh:
+            self.img = QImage(fw, fh, QImage.Format_RGB32)
+            self.img.fill(QColor("#040608"))
+        p = QPainter(self.img)
+        p.drawImage(tx, ty, tile)
+        p.end()
         self.update()
 
     def _map_pos(self, pos: QPoint):
@@ -323,7 +334,7 @@ class MainWindow(QMainWindow):
         btn_conn.setObjectName("accent")
         btn_conn.clicked.connect(self.reconnect)
 
-        self.lbl_stat = QLabel("UDP FPS: -- | -- KB/s | Kayıp: 0.0% | 2400×1080")
+        self.lbl_stat = QLabel("UDP FPS: -- | -- KB/s | Kayıp: 0.0% | 3840×2160")
         self.lbl_stat.setObjectName("pill")
 
         btn_chr = QPushButton("🌐 Chromium")
@@ -332,6 +343,10 @@ class MainWindow(QMainWindow):
         btn_term.clicked.connect(lambda: self.transport.send_cmd(2))
         btn_files = QPushButton("📁 Dosyalar")
         btn_files.clicked.connect(lambda: self.transport.send_cmd(3))
+        btn_4k = QPushButton("4K")
+        btn_4k.clicked.connect(lambda: self.transport.send_cmd(7))
+        btn_1080 = QPushButton("1080p")
+        btn_1080.clicked.connect(lambda: self.transport.send_cmd(8))
         btn_scr = QPushButton("💡 Ekran")
         btn_scr.clicked.connect(lambda: self.transport.send_cmd(4))
         btn_land = QPushButton("↔ Yatay")
@@ -346,7 +361,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(btn_conn)
         bar.addWidget(self.lbl_stat)
         bar.addStretch(1)
-        for b in (btn_chr, btn_term, btn_files, btn_scr, btn_land, btn_port, btn_fs):
+        for b in (btn_chr, btn_term, btn_files, btn_4k, btn_1080, btn_scr, btn_land, btn_port, btn_fs):
             bar.addWidget(b)
         root.addLayout(bar)
 
@@ -374,7 +389,7 @@ class MainWindow(QMainWindow):
         self.canvas = ScreenCanvas(self.transport)
         root.addWidget(self.canvas, 1)
 
-        self.signals.frame_ready.connect(self.canvas.set_frame)
+        self.signals.tile_ready.connect(self.canvas.set_tile)
         self.signals.stats_ready.connect(self.on_stats)
 
         self.reconnect()

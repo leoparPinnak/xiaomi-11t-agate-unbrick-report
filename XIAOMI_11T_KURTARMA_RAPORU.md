@@ -291,14 +291,16 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - `:8090` ve `:8080` üzerine `draggable="false"` + `pointerdown/pointermove/pointerup` + `setPointerCapture` ile gerçek tutup sürükleme; `:8090` içine `/ws/input` WebSocket kanalı, `Ctrl+A/C/V/X/Z/T/W` / `Alt+Tab` kısayol barı ve çakışmasız boş keycode slotları (`154..197`) ile tam Türkçe karakter (`ç ğ ı İ ö ş ü`) desteği eklendi.
    - Python 3.10 Garbage Collector'ın referanssız `asyncio.create_task` soket okuyucularını iptal ederek `FPS: 0` üretmesi (`Task was destroyed but it is pending`) her iki sunucuda `_spawn()` referans setiyle kalıcı çözüldü.
 
-### Adım 19: Sıfır-Aracı Saf UDP Görüntü & Girdi Sunucusu (`:9900`) ve PySide6 UDP Masaüstü İstemcisi
-1. **Doğrudan C Çekirdeğinden UDP Yayın (`scripts/fb_xfce_bridge.c`):**
-   - `fb_xfce_bridge` üzerine `4 MB` send buffer'lı **UDP `:9900`** dinleyici ve yayıncı eklendi.
-   - `AGTH` (Hello/keepalive) gönderen istemciye `AGTS` (`width×height`, ekran durumu) yanıtı döner; `/dev/video4`'ten çıkan her JPEG kareyi `1360 byte` parçalara bölerek (`AGTU` başlığı + `frame_id`, `chunk_idx`, `chunk_cnt`) doğrudan UDP ile yollar.
-   - `AGTI` ikili girdi protokolü ile fare hareket/tıklama/sürükleme/tekerlek, kısayol tuşları (`Ctrl/Alt/Shift`), Türkçe UTF-8 metin ve uygulama/döndürme komutlarını doğrudan C üzerinden X11'e (`XTest`) basar.
-2. **Sıfırdan Qt6 (PySide6) UDP İstemcisi (`scripts/agate_udp_client.py`):**
-   - Eski yarım kalan kareleri atarak head-of-line takılmasını önler; `QImage.fromData(..., "JPEG")` (`libjpeg-turbo`) ile doğrudan GPU/Qt penceresine çizer.
-   - Canlı test sonucu: **19.7 FPS (`2400×1080`, ~2.7 MB/s)**, PySide6 GUI üzerinde **%0.0 paket kaybı** ile doğrulandı (`C:\mtk\agate_udp_client.py` ve `C:\mtk\baslat_udp_ekran.bat`).
+### Adım 19: Sıfır-Aracı Saf UDP (`:9900`), 4K UHD (`3840×2160`) Karo Motoru ve PySide6 İstemcisi
+1. **Doğrudan C Çekirdeğinden Saf UDP Yayın (`scripts/fb_xfce_bridge.c`):**
+   - Tüm TCP yayın sunucuları (`:8080`, `:8090`, `:9222`) durduruldu; görüntü ve girdi tamamen **`UDP :9900`** üzerinden taşınır.
+   - `AGTH` (Hello/keepalive) → `AGTS` (`width×height`), `AGTI` ikili girdi protokolüyle fare hareket/tıklama/sürükleme/tekerlek, kısayollar (`Ctrl/Alt/Shift`), Türkçe UTF-8 ve uygulama/çözünürlük komutları (`XInitThreads()` korumalı) doğrudan C'den X11'e basılır.
+2. **4K (`3840×2160`) 2×2 Karo (`AGTT`) Motoru + Telefon Ekranı Dondurma:**
+   - Donanım testinde `17030000.jpgenc` (`/dev/video3`) 4K'da hata verirken `17830000.jpgenc` (`/dev/video4`) tek parça 16.5 MB çıktı tamponunda 32-bit M4U/IOMMU (`0xFF02E000 + 16 MB > 4 GB`) sınırına takıldığı için `3840×2160` masaüstü **4 adet `1920×1080` donanım JPEG karosuna** bölündü (`AGTT` protokolü).
+   - Yalnızca pikseli değişen karolar NEON + `/dev/video4` ile encode edilip round-robin tazelemeyle gönderilir; `4K`/`1080p` modlarında telefonun fiziksel AMOLED ekranı kapatılıp dondurulur (`brightness=0`, `/dev/fb0` döngüsü devre dışı).
+3. **Sıfırdan Qt6 (PySide6) UDP İstemcisi (`scripts/agate_udp_client.py`):**
+   - Gelen `AGTT` karolarını doğrudan `QImage(3840, 2160)` üzerine çizer (`8 MB` RX buffer, `4K`/`1080p`/`Yatay`/`Dikey`, `F11` tam ekran).
+   - Canlı 4K doğrulama sonucu: **4/4 karo tam (`3840×2160`), `~693 KB/s`, `%0.0` paket kaybı** (`C:\mtk\agate_udp_client.py` ve `C:\mtk\baslat_udp_ekran.bat`).
 
 ---
 

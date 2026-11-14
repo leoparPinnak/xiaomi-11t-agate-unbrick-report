@@ -5,8 +5,8 @@ case "$1" in
   kapat|off|0) echo off > "$CTL" ;;
   toggle|t)    echo toggle > "$CTL" ;;
   xfce)
-    /usr/local/sbin/start_xfce_fb.sh "$2"
-    echo "XFCE masaustu telefon ekranina basildi (${2:-yatay} 2400x1080, Guc tusu: ac/kapa, Dokunmatik aktif)"
+    /usr/local/sbin/start_xfce_fb.sh "${2:-4k}"
+    echo "XFCE masaustu UDP :9900 baslatildi (mod=${2:-4k}, telefon ekrani 4k/1080p'de donduruldu)"
     ;;
   terminal|dash)
     pkill -f fb_xfce_bridge 2>/dev/null || true
