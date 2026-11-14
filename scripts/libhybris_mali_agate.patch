@@ -1,0 +1,218 @@
+diff --git a/hybris/common/hooks.c b/hybris/common/hooks.c
+index 67bbf31..1a1f7fd 100644
+--- a/hybris/common/hooks.c
++++ b/hybris/common/hooks.c
+@@ -68,6 +68,7 @@
+ #include <sys/uio.h>
+ 
+ #include <sys/mman.h>
++#include <sys/ioctl.h>
+ #include <libgen.h>
+ #include <mntent.h>
+ 
+@@ -2372,6 +2373,33 @@ struct open_redirect open_redirects[] = {
+     { NULL, NULL }
+ };
+ 
++static int _hybris_ion_fd = -1;
++
++static int _hybris_hook_ioctl(int fd, unsigned long req, void *arg)
++{
++    if (fd >= 0 && fd == _hybris_ion_fd) {
++        unsigned int *u = (unsigned int *)arg;
++        unsigned int nr = req & 0xff;
++        unsigned int typ = (req >> 8) & 0xff;
++        if (typ == 'I' && nr == 0 && arg != NULL) {
++            /* ion_allocation_data: len(u64 @ u[0..1]), heap_id_mask(u32 @ u[2]) or old align(u64)+heap_id(u32 @ u[4]) */
++            unsigned int sz = (req >> 16) & 0x3fff;
++            unsigned int heap_mask = (sz == 24) ? u[2] : ((sz >= 32) ? u[4] : 0);
++            if (heap_mask > 1 && (heap_mask & 1) == 0) {
++                errno = ENODEV;
++                return -1;
++            }
++        }
++    }
++    return ioctl(fd, req, arg);
++}
++
++int _hybris_hook_open(const char *pathname, int flags, ...);
++static int _hybris_hook___open_2(const char *pathname, int flags)
++{
++    return _hybris_hook_open(pathname, flags);
++}
++
+ int _hybris_hook_open(const char *pathname, int flags, ...)
+ {
+     va_list ap;
+@@ -2397,7 +2425,11 @@ int _hybris_hook_open(const char *pathname, int flags, ...)
+             va_end(ap);
+     }
+ 
+-    return open(target_path, flags, mode);
++    int __ret = open(target_path, flags, mode);
++    if (__ret >= 0 && target_path && strcmp(target_path, "/dev/ion") == 0) {
++        _hybris_ion_fd = __ret;
++    }
++    return __ret;
+ }
+ 
+ /**
+@@ -2589,6 +2621,11 @@ static locale_t _hybris_hook_duplocale(locale_t locobj)
+     return duplocale(locobj);
+ }
+ 
++static size_t _hybris_hook___ctype_get_mb_cur_max(void)
++{
++    return __ctype_get_mb_cur_max();
++}
++
+ static locale_t _hybris_hook_uselocale(locale_t newloc)
+ {
+     TRACE_HOOK("");
+@@ -3236,6 +3273,8 @@ static struct _hook hooks_common[] = {
+     HOOK_INDIRECT(versionsort),
+     /* fcntl.h */
+     HOOK_INDIRECT(open),
++    HOOK_INDIRECT(__open_2),
++    HOOK_INDIRECT(ioctl),
+     HOOK_INDIRECT(__get_tls_hooks),
+     HOOK_DIRECT_NO_DEBUG(sscanf),
+     HOOK_DIRECT_NO_DEBUG(scanf),
+@@ -3311,6 +3350,7 @@ static struct _hook hooks_mm[] = {
+     HOOK_DIRECT(newlocale),
+     HOOK_DIRECT(freelocale),
+     HOOK_DIRECT(duplocale),
++    HOOK_DIRECT(__ctype_get_mb_cur_max),
+     HOOK_DIRECT(uselocale),
+     HOOK_DIRECT(localeconv),
+     HOOK_DIRECT(setlocale),
+diff --git a/hybris/egl/egl.c b/hybris/egl/egl.c
+index 0051d37..16fcb42 100644
+--- a/hybris/egl/egl.c
++++ b/hybris/egl/egl.c
+@@ -46,7 +46,7 @@ static void *egl_handle = NULL;
+ static void *glesv2_handle = NULL;
+ static void *_hybris_libgles1 = NULL;
+ static void *_hybris_libgles2 = NULL;
+-static int _egl_context_client_version = 1;
++static int _egl_context_client_version = 2;
+ 
+ static EGLint      (*_eglGetError)(void) = NULL;
+ 
+@@ -206,6 +206,23 @@ static const char * _defaultEglPlatform()
+ 	return egl_platform;
+ }
+ 
++
++static EGLBoolean _my_eglQueryDevicesEXT(EGLint max_devices, void **devices, EGLint *num_devices) {
++    if (num_devices) *num_devices = 1;
++    if (devices && max_devices > 0) devices[0] = (void*)0x4d414c49ULL;
++    return EGL_TRUE;
++}
++static EGLBoolean _my_eglQueryDeviceAttribEXT(void *device, EGLint attribute, EGLAttrib *value) {
++    return EGL_FALSE;
++}
++static const char* _my_eglQueryDeviceStringEXT(void *device, EGLint name) {
++    return (name == 0x3222) ? "/dev/dri/card0" : "";
++}
++static EGLBoolean _my_eglQueryDisplayAttribEXT(EGLDisplay dpy, EGLint attribute, EGLAttrib *value) {
++    if (attribute == 0x322C && value) { *value = (EGLAttrib)0x4d414c49ULL; return EGL_TRUE; }
++    return EGL_FALSE;
++}
++
+ #ifndef WANT_GLVND
+ static
+ #endif
+@@ -241,6 +258,13 @@ EGLDisplay __eglHybrisGetPlatformDisplayCommon(EGLenum platform,
+ 			break;
+ #endif
+ 
++		case 0x31DD: /* EGL_PLATFORM_SURFACELESS_MESA */
++		case 0x31D5: /* EGL_PLATFORM_X11_KHR */
++		case 0x31D7: /* EGL_PLATFORM_GBM_KHR */
++		case 0x313F: /* EGL_PLATFORM_DEVICE_EXT */
++			hybris_ws = "null";
++			break;
++
+ 		default:
+ 			__eglHybrisSetError(EGL_BAD_PARAMETER);
+ 			return EGL_NO_DISPLAY;
+@@ -316,8 +340,8 @@ const char * eglQueryString(EGLDisplay dpy, EGLint name)
+ 	if (dpy == EGL_NO_DISPLAY && name == EGL_EXTENSIONS) {
+ 		const char *ret = _eglQueryString(dpy, name);
+ 		static char eglextensionsbuf[2048];
+-		snprintf(eglextensionsbuf, 2046, "%s %s", ret,
+-			"EGL_EXT_client_extensions EGL_EXT_platform_wayland EGL_KHR_platform_wayland"
++		snprintf(eglextensionsbuf, 2046, "%s %s", ret ? ret : "",
++			"EGL_EXT_device_base EGL_EXT_device_enumeration EGL_EXT_device_query EGL_EXT_platform_base EGL_KHR_client_get_all_proc_addresses EGL_EXT_client_extensions EGL_EXT_platform_device EGL_EXT_platform_wayland EGL_KHR_platform_wayland EGL_EXT_platform_x11 EGL_KHR_platform_x11 EGL_MESA_platform_surfaceless"
+ 		);
+ 		ret = eglextensionsbuf;
+ 		return ret;
+@@ -555,6 +579,30 @@ static struct FuncNamePair _eglHybrisOverrideFunctions[] = {
+ 	OVERRIDE_MY(glEGLImageTargetRenderbufferStorageOES),
+ 	OVERRIDE_MY(eglDestroyImageKHR),
+ 	OVERRIDE_SAMENAME(eglGetError),
++	OVERRIDE_SAMENAME(eglBindAPI),
++	OVERRIDE_SAMENAME(eglBindTexImage),
++	OVERRIDE_SAMENAME(eglChooseConfig),
++	OVERRIDE_SAMENAME(eglCopyBuffers),
++	OVERRIDE_SAMENAME(eglCreatePbufferFromClientBuffer),
++	OVERRIDE_SAMENAME(eglCreatePbufferSurface),
++	OVERRIDE_SAMENAME(eglCreatePixmapSurface),
++	OVERRIDE_SAMENAME(eglDestroyContext),
++	OVERRIDE_SAMENAME(eglGetConfigAttrib),
++	OVERRIDE_SAMENAME(eglGetConfigs),
++	OVERRIDE_SAMENAME(eglGetCurrentContext),
++	OVERRIDE_SAMENAME(eglGetCurrentDisplay),
++	OVERRIDE_SAMENAME(eglGetCurrentSurface),
++	OVERRIDE_SAMENAME(eglMakeCurrent),
++	OVERRIDE_SAMENAME(eglQueryAPI),
++	OVERRIDE_SAMENAME(eglQueryContext),
++	OVERRIDE_SAMENAME(eglQueryString),
++	OVERRIDE_SAMENAME(eglQuerySurface),
++	OVERRIDE_SAMENAME(eglReleaseTexImage),
++	OVERRIDE_SAMENAME(eglReleaseThread),
++	OVERRIDE_SAMENAME(eglSurfaceAttrib),
++	OVERRIDE_SAMENAME(eglWaitClient),
++	OVERRIDE_SAMENAME(eglWaitGL),
++	OVERRIDE_SAMENAME(eglWaitNative),
+ 	OVERRIDE_SAMENAME(eglGetDisplay),
+ 	OVERRIDE_SAMENAME(eglGetPlatformDisplay),
+ 	OVERRIDE_SAMENAME(eglInitialize),
+@@ -593,6 +641,10 @@ static struct FuncNamePair _eglHybrisOverrideFunctions[] = {
+ 	 * [1] https://gitlab.freedesktop.org/glvnd/libglvnd/-/issues/214
+ 	 */
+ 	OVERRIDE_TO(eglGetPlatformDisplayEXT, eglGetPlatformDisplay),
++	{ .name = "eglQueryDevicesEXT", .func = (__eglMustCastToProperFunctionPointerType) _my_eglQueryDevicesEXT },
++	{ .name = "eglQueryDeviceAttribEXT", .func = (__eglMustCastToProperFunctionPointerType) _my_eglQueryDeviceAttribEXT },
++	{ .name = "eglQueryDeviceStringEXT", .func = (__eglMustCastToProperFunctionPointerType) _my_eglQueryDeviceStringEXT },
++	{ .name = "eglQueryDisplayAttribEXT", .func = (__eglMustCastToProperFunctionPointerType) _my_eglQueryDisplayAttribEXT },
+ 	OVERRIDE_MY(eglCreatePlatformWindowSurfaceEXT),
+ 	OVERRIDE_TO(eglCreatePlatformPixmapSurfaceEXT, eglCreatePixmapSurface),
+ };
+diff --git a/hybris/egl/platforms/null/eglplatform_null.c b/hybris/egl/platforms/null/eglplatform_null.c
+index b7d3327..ec34f14 100644
+--- a/hybris/egl/platforms/null/eglplatform_null.c
++++ b/hybris/egl/platforms/null/eglplatform_null.c
+@@ -34,7 +34,7 @@ static HYBRIS_IMPLEMENT_FUNCTION0(nullui, EGLNativeWindowType, android_createDis
+ 
+ static void nullws_init_module(struct ws_egl_interface *egl_iface)
+ {
+-        hybris_gralloc_initialize(0);
++        /* gralloc not needed for headless pbuffer/surfaceless */
+ 	eglplatformcommon_init(egl_iface);
+ }
+ 
+diff --git a/hybris/egl/platforms/wayland/eglplatform_wayland.cpp b/hybris/egl/platforms/wayland/eglplatform_wayland.cpp
+index 873451e..6d510c9 100644
+--- a/hybris/egl/platforms/wayland/eglplatform_wayland.cpp
++++ b/hybris/egl/platforms/wayland/eglplatform_wayland.cpp
+@@ -71,7 +71,7 @@ struct WaylandDisplay {
+ 
+ extern "C" void waylandws_init_module(struct ws_egl_interface *egl_iface)
+ {
+-	hybris_gralloc_initialize(0);
++	/* skip gralloc */
+ 	eglplatformcommon_init(egl_iface);
+ }
+ 

@@ -4,13 +4,13 @@ import base64
 import json
 import os
 import subprocess
-import time
 import aiohttp
 from aiohttp import web
 
 CDP_PORT = 9222
 HTTP_PORT = 8080
 USER_DIR = "/tmp/chrome_profile"
+XDG_DIR = "/tmp/xdg_chrome_rt"
 
 latest_frame = None
 frame_event = asyncio.Event()
@@ -29,15 +29,56 @@ async def cdp_call(method, params=None):
 async def cdp_loop():
     global latest_frame, cdp_ws
     os.makedirs(USER_DIR, exist_ok=True)
-    proc = subprocess.Popen(
+    os.makedirs(XDG_DIR, mode=0o700, exist_ok=True)
+    os.chmod(XDG_DIR, 0o700)
+
+    weston_env = {**os.environ, "XDG_RUNTIME_DIR": XDG_DIR}
+    subprocess.Popen(
+        [
+            "/usr/bin/weston",
+            "--backend=headless-backend.so",
+            "--socket=wayland-1",
+            "--width=1920",
+            "--height=1080",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=weston_env,
+    )
+    for _ in range(30):
+        if os.path.exists(os.path.join(XDG_DIR, "wayland-1")):
+            break
+        await asyncio.sleep(0.1)
+
+    chrome_env = {
+        **os.environ,
+        "XDG_RUNTIME_DIR": XDG_DIR,
+        "WAYLAND_DISPLAY": "wayland-1",
+        "LD_LIBRARY_PATH": "/usr/local/hybris/lib",
+        "HYBRIS_LD_LIBRARY_PATH": (
+            "/mnt/avendor/lib64:/mnt/avendor/lib64/egl:/mnt/avendor/lib64/hw:"
+            "/mnt/asystem/system/lib64:/mnt/asystem/system/lib64/bootstrap:"
+            "/apex/com.android.runtime/lib64/bionic"
+        ),
+        "HYBRIS_EGLPLATFORM": "wayland",
+        "LIBEGL": "/mnt/avendor/lib64/egl/libGLES_mali.so",
+        "LIBGLESV2": "/mnt/avendor/lib64/egl/libGLES_mali.so",
+        "DBUS_SESSION_BUS_ADDRESS": "disabled:",
+    }
+
+    subprocess.Popen(
         [
             "/usr/bin/chromium",
-            "--headless=new",
             "--no-sandbox",
-            "--disable-gpu",
             "--disable-dev-shm-usage",
+            "--ozone-platform=wayland",
+            "--use-gl=angle",
+            "--use-angle=gles",
+            "--disable-vulkan",
+            "--disable-features=Vulkan,Translate,OptimizationHints,MediaRouter,InterestCohort",
+            "--ignore-gpu-blocklist",
+            "--enable-webgl",
             "--disable-blink-features=AutomationControlled",
-            "--disable-features=Translate,OptimizationHints,MediaRouter,InterestCohort",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
@@ -54,8 +95,9 @@ async def cdp_loop():
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env={**os.environ, "DBUS_SESSION_BUS_ADDRESS": "disabled:"},
+        env=chrome_env,
     )
+
     async with aiohttp.ClientSession() as sess:
         ws_url = None
         for _ in range(40):
@@ -100,7 +142,7 @@ HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Xiaomi 11T Chromium Live Stream</title>
+<title>Xiaomi 11T Chromium Live Stream (Mali-G77 GPU)</title>
 <style>
   body { margin:0; background:#111; color:#eee; font-family:system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; }
   .bar { width:100%; max-width:1280px; display:flex; gap:8px; padding:10px; box-sizing:border-box; background:#1b1f22; }

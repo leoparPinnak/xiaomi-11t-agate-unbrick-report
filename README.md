@@ -221,6 +221,22 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - `python3-aiohttp` ile `/opt/chrome_stream/server.py` geliştirildi: Chromium CDP `Page.startScreencast` üzerinden `1280×720` kareleri yakalayıp `:8080/` (etkileşimli uzaktan kontrol), `:8080/stream.mjpg` (ham MJPEG akışı) ve `:8080/frame.jpg` olarak sundu (kablosuz Wi-Fi'den canlı görüntülendi).
    - Gün sonu soğutma ve ertesi günkü özel yazılım geliştirme çalışması öncesinde `chrome_stream` süreci durduruldu (kod `/opt/chrome_stream/server.py` ve repoda hazır bekler).
 
+### Adım 14: Mali-G77 MC9 Donanım GPU'sunun Saf Ubuntu `glibc` ve Chromium 156'da Çalıştırılması
+1. **Android `vendor_a` ve `system_a` Salt-Okunur Bağlantısı (Sıfır Ek Disk):**
+   - `super` (`/dev/sdc62`) içindeki `vendor_a` (`offset 1931476992` → `/mnt/avendor`) ve `system_a` (`offset 3399483392` → `/mnt/asystem`) salt-okunur bağlandı; `/system/vendor -> /mnt/avendor` bağlantısı ve `/sbin/linux_init` açılış kalıcılığı eklendi.
+   - `/mnt/avendor/lib64/egl/libGLES_mali.so` (`r25p0-00cet2`, 37.95 MB) kütüphanesinin 62 geçişli `.so` bağımlılığının tamamının (`0` eksik) mevcut olduğu doğrulandı.
+2. **`libhybris` Derlemesi ve 5 Kritik Android 11 / MediaTek Uyum Yaması (`scripts/libhybris_mali_agate.patch`):**
+   - `Halium/android-headers` (`halium-11.0`) ile `libhybris` (`--enable-arch=arm64 --enable-mali-quirks --enable-wayland`) `/usr/local/hybris` altına derlendi; çıkan engeller tek tek teşhis edilip çözüldü:
+     1. **`__ctype_get_mb_cur_max` TLS Çökmesi (`SEGV at 0x820`):** Android 11 Bionic `libc.so` `TLS_SLOT_BIONIC_TLS` (`[tpidr_el0 - 8]`) okuması `glibc` TCB'sinde NULL olduğu için `hooks.c` içine `HOOK_DIRECT(__ctype_get_mb_cur_max)` eklendi → `libGLES_mali.so` yüklendi ve `test_opencl` **`Mali-G77 MC9 r0p1` (`OpenCL Success!`)** verdi.
+     2. **`soter_open` TEE Kilitlenmesi:** `eglGetDisplay` sırasında `libGLES_mali.so`'nun `/dev/ion` üzerinde güvenli heap denemesi (`heap_id_mask=0x2000`) `ion_sec_heap_allocate -> soter_open` üzerinden TEE daemon bekleyip takılıyordu. `libion.so` `__open_2@LIBC` kullandığı tespit edilerek `hooks.c` içine `__open_2` + `ioctl` hooku eklendi ve güvenli heap `ENODEV` ile atlandı → saf Pbuffer üzerinde **`GL_RENDERER: Mali-G77 MC9` (`OpenGL ES 3.2`)** çalıştı ve `glReadPixels` ile GPU çizimi doğrulandı.
+     3. **`gralloc` Stack-Guard Çakışması:** Headless `null` ve `wayland` platform başlatıcılarındaki gereksiz `hybris_gralloc_initialize(0)` kaldırıldı.
+     4. **Chromium ANGLE `DisplayEGL` Eksik Çekirdek EGL Girişleri:** ANGLE bütün core EGL fonksiyonlarını (`eglBindAPI`, `eglChooseConfig`, `eglCreatePbufferSurface`, `eglMakeCurrent`, `eglQueryString` vb.) `eglGetProcAddress` üzerinden istediği için `egl.c` `_eglHybrisOverrideFunctions[]` tablosuna tüm core EGL fonksiyonları, `EGL_PLATFORM_SURFACELESS_MESA`/`DEVICE_EXT` desteği ve `eglQueryDevicesEXT` eklendi.
+     5. **GLESv1/v2 Varsayılanı:** `egl.c` içindeki `_egl_context_client_version` başlangıç değeri `2` yapılarak Chromium GPU prosesi `SIGSEGV` (`exit_code=11`) tamamen giderildi.
+3. **Doğrulanan Sonuçlar:**
+   - **Weston Headless (`--backend=headless-backend.so`) + `libhybris` + Chromium 156 (`scripts/chrome-gpu.sh` & `scripts/chrome_stream_server.py`):**
+   - WebGL 2.0 `UNMASKED_RENDERER_WEBGL`: **`ANGLE (ARM, Mali-G77 MC9, OpenGL ES 3.2)`**
+   - `/dev/mali0`, `/dev/ion`, `/dev/video*`, `/dev/dri/card0` izinleri `0666` olarak `/sbin/linux_init` içine sabitlendi.
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -242,7 +258,8 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/build_native_boot.py` | Stok `kernel` + `dtb` + statik `busybox` `initramfs` ile Android'siz `boot.img` üreticisi |
 | `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı (RNDIS + MTK Wi-Fi + SSH + ekran karartma + %60–%70 şarj kesici) |
 | `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `pyte`/`tmux` terminal + Güç tuşu ekran aç/kapa |
-| `scripts/chrome_stream_server.py` | Chromium 156 CDP `Page.startScreencast` → MJPEG / web uzaktan kontrol sunucusu (`:8080`) |
+| `scripts/libhybris_mali_agate.patch` | `libhybris` Mali-G77 MC9 (`Android 11` / `MT6893` `/dev/ion` & ANGLE) tam yaması |
+| `scripts/chrome-gpu.sh` & `scripts/chrome_stream_server.py` | Mali-G77 GPU hızlandırmalı Chromium 156 başlatıcısı ve `:8080` canlı akış sunucusu |
 | `scripts/geri_donus_v1259_fastboot.ps1` & `geri_donus_v1302_fastboot.ps1` | Bootloader kilitlemeden Android 11 / Android 12 geri dönüş betikleri |
 
 ---
@@ -250,38 +267,24 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 ## 6. Durum Özeti
 
 - **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
-- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — `super` boş alanındaki 2.2 GB `ext4` bölümünden (`1.3 GB` boş) açılıyor; **USB RNDIS (`192.168.77.1:2222`)**, **Wi-Fi (`192.168.2.212:2222`)**, **%60–%70 şarj kesici**, **telemetrili `/dev/fb0` ekran arayüzü** (`Güç` tuşuyla aç/kapa, otomatik SSH `tmux` aynalama) ve **ARM64 Chromium 156** aktif.
+- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — `super` boş alanındaki 2.2 GB `ext4` bölümünden açılıyor; **USB RNDIS (`192.168.77.1:2222`)**, **Wi-Fi (`192.168.2.212:2222`)**, **%60–%70 şarj kesici**, **telemetrili `/dev/fb0` ekran arayüzü** (`Güç` tuşuyla aç/kapa, otomatik SSH `tmux` aynalama) ve **Mali-G77 MC9 GPU hızlandırmalı ARM64 Chromium 156** aktif.
 - **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır.
 
 ---
 
-## 7. Yarınki Oturum İçin Devir Notu (Handoff — Sıfır Bilgiyle Devam Rehberi)
+## 7. Devam Edilecek Sıradaki Adımlar (10 Chrome Penceresi Donanım Encode)
 
-Bu bölümü yeni bir oturumda sıfırdan başlarken bağlamı anında yüklemek için kullanabilirsiniz:
+### A. Çözülenler & Aktif Donanım Düğümleri
+- **GPU ÇÖZÜLDÜ:** **`Mali-G77 MC9`** (`/dev/mali0` + `libhybris` `/usr/local/hybris/lib`) **OpenCL 2.1**, **OpenGL ES 3.2** ve **Chromium 156 WebGL 2.0 (`ANGLE (ARM, Mali-G77 MC9, OpenGL ES 3.2)`)** ile tam çalışır durumda.
+- **Sıradaki Donanım Video & JPEG Kodlayıcı Düğümleri (Hazır, Test Bekliyor):**
+  - **`/dev/video3`** & **`/dev/video4`**: Çift donanım `mtk-jpeg-enc` (`NM12`, `NM21`, `YUYV`, `YVYU` → `JPEG`)
+  - **`/dev/video2`**: `mtk-vcodec-enc` (H.264/HEVC V4L2 encoder, `/dev/vcu`)
+  - **`/dev/mtk_mdp`**: Donanım renk/ölçekleme motoru
 
-### A. Cihazın Şu Anki Canlı Durumu
-- **Cihaz:** Xiaomi 11T (`agate`, MT6893 Dimensity 1200, 8 GB RAM, 128 GB UFS), Bootloader **açık**.
-- **Çalışan OS:** Android yok — `boot_a` doğrudan `super` (`/dev/sdc62`, offset `6622253056`, 2.2 GB `ext4`) üzerindeki **Ubuntu 22.04.5 LTS** sistemini `/sbin/linux_init` ile PID 1 olarak başlatıyor.
-- **SSH Erişimi:** `ssh -p 2222 ubuntu@192.168.2.212` (Wi-Fi) veya `ssh -p 2222 ubuntu@192.168.77.1` (USB RNDIS) — geçici şifre `ubuntu`, bu PC'nin `id_ed25519.pub` anahtarı yüklü. Etkileşimli SSH otomatik olarak telefon ekranındaki `tmux` oturumuna (`ekran baglan`) düşer.
-- **Çekirdek:** `Linux 4.14.186-g1338473e1825 aarch64` (stok `V12.5.9.0` kernel + dtb).
-- **Aktif Donanım Düğümleri:**
-  - GPU & DRM: **`/dev/mali0`** (`10, 96` — Mali-G77 MC9 `mali_kbase`), **`/dev/dri/card0`** (`226, 0`), **`/dev/ion`** (`10, 123`), **`/dev/mtk_mdp`** (`245, 0` — donanım ölçekleme/renk dönüştürme).
-  - Donanım Video & JPEG Kodlayıcılar (`CONFIG_VIDEO_V4L2=y`, `CONFIG_V4L2_MEM2MEM_DEV=y`, `CONFIG_VIDEO_MEDIATEK_JPEG=y`):
-    - **`/dev/video1`**: `mtk-vcodec-dec` (81:1)
-    - **`/dev/video2`**: `mtk-vcodec-enc` (81:2 — H.264/HEVC V4L2 encoder)
-    - **`/dev/video3`** & **`/dev/video4`**: Çift donanım `mtk-jpeg-enc` (81:3, 81:4 — `17030000.jpgenc` & `17830000.jpgenc`)
-    - **`/dev/vcu`**: Video Codec Unit (`477, 0`)
-  - Ekran: `/dev/fb0` (`1080×2400`, `stride=4352`), `/sys/class/leds/lcd-backlight/brightness`, `/sys/class/graphics/fb0/blank`, `/dev/input/event1` (`mtk-kpd`, `KEY_POWER=116`).
-  - Pil Koruma: `/sys/class/power_supply/battery/input_suspend` (`charge-limit.sh`, %60–%70 arası tutar).
-  - Wi-Fi: `/vendor/lib/modules/` (`conninfra.ko`, `bt_drv.ko`, `wmt_chrdev_wifi.ko`, `wlan_drv_gen4m.ko`) + Bionic `conninfra_loader` / `wlan_assistant` ile sorunsuz çalışıyor.
-
-### B. Yarın Üzerinde Çalışılacak Ar-Ge Konuları (Hedef: Aynı Anda 10 Chrome Penceresi Donanım Encode)
-1. **CPU Bağımlı Ekran/Video Encode Hızlandırma & Donanım GPU Kullanımı:**
-   - Mevcut `/opt/chrome_stream/server.py` (anti-bot bayrakları + `1920×1080` eklendi) CPU tabanlı (`SwiftShader` + yazılım JPEG) çalışıyor.
-   - **Yarınki Somut Test Planı (10 Eşzamanlı Chrome Penceresi Hedefi):**
-     1. **Donanım JPEG & Video Kodlayıcı (`V4L2 M2M`):** Çekirdekte zaten açık olan **`/dev/video3` & `/dev/video4` (`mtk-jpeg-enc`)** ve **`/dev/video2` (`mtk-vcodec-enc`)** düğümlerine doğrudan Linux `V4L2` `ioctl` (`v4l2-ctl` / küçük C/Python V4L2 M2M test aracı) ile bağlanıp sıfır CPU ile donanım JPEG / H.264 encode edilip edilemediğini test etmek (`mtk-vcodec-enc` VCU daemon isterse Android `/vendor/bin/vcu*` ikililerini bağlamak).
-     2. **Mali-G77 MC9 GPU Hızlandırması (`/dev/mali0`):** Ubuntu `glibc` içinde **`libhybris` + Android `/vendor/lib64/egl/libGLES_mali.so`** köprüsüyle gerçek Mali-G77 EGL/GLES hızlandırmasını açıp Chromium/render yükünü CPU'dan GPU'ya taşımak.
-     3. **Çoklu Pencere Mimarisi:** 10 pencere için tek Chromium prosesi içinde 10 ayrı `Target.createTarget` + `BrowserContext` (izole profil/çerez, 10 ayrı process yerine tek browser + renderer paylaşımı -> ~3–4 GB RAM) + `zram` swap + donanım encode (`video3`/`video4`/`video2`).
-     4. **Kendi Kernelimizi Derleme (`MiCode/Xiaomi_Kernel_OpenSource` — `agate-r-oss` / `agate-u-oss`):** `CONFIG_DEVTMPFS=y`, `CONFIG_USER_NS=y`, `CONFIG_SYSVIPC=y`, `CONFIG_CGROUP_PIDS=y`, `CONFIG_VT=y`, `CONFIG_WIREGUARD=y` açıp tam Docker/sandbox desteği sağlamak.
-2. **Depolama Genişletme (Hazır Olunduğunda):**
-   - `userdata` (`106 GB`, `/dev/sdc76`) Android'e dönmeye gerek kalmadığına karar verildiğinde `ext4` formatlanıp Ubuntu rootfs oraya taşınabilir (`seccfg` / `lk_a` etkilenmediği için bootloader açık kalır).
+### B. Sıradaki Somut Plan
+1. **Donanım JPEG & Video Encode (`/dev/video3`, `/dev/video4`, `/dev/video2`):**
+   - `mtk-jpeg-enc` (`/dev/video3`, `/dev/video4`) ve `mtk-vcodec-enc` (`/dev/video2`) düğümlerini V4L2 M2M üzerinden test edip kare encode'u CPU'dan donanım motoruna almak.
+2. **10 Eşzamanlı Chrome Penceresi Mimarisi:**
+   - 10 ayrı Chromium prosesi yerine tek Mali-G77 GPU'lu Chromium prosesinde 10 izole `BrowserContext` (`Target.createTarget`) + `zram` swap + donanım encode (`video3`/`video4`/`video2`).
+3. **Ses Akışı (Gerektiğinde):** `PulseAudio` `module-null-sink` üzerinden WebSocket/Opus ses aktarımı.
+4. **Depolama Genişletme & Özel Kernel (Opsiyonel):** `userdata` (`106 GB`) bölümünü ext4 Ubuntu diski yapmak ve gerekirse `CONFIG_USER_NS`/`SYSVIPC`/`DEVTMPFS` açık özel kernel derlemek.

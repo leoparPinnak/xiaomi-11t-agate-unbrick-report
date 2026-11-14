@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 
@@ -81,6 +81,16 @@ else
 fi
 
 echo "=== Linux init ready ==="
+/usr/bin/python3 /usr/local/sbin/fbui.py >/var/log/fbui.log 2>&1 &
+mkdir -p /mnt/avendor /mnt/asystem /system
+[ ! -e /dev/loop1 ] && mknod -m 0660 /dev/loop1 b 7 1
+[ ! -e /dev/loop2 ] && mknod -m 0660 /dev/loop2 b 7 2
+busybox losetup -o 1931476992 /dev/loop1 /dev/sdc62 2>/dev/null || true
+busybox losetup -o 3399483392 /dev/loop2 /dev/sdc62 2>/dev/null || true
+mount -t ext4 -o ro /dev/loop1 /mnt/avendor 2>/dev/null || true
+mount -t ext4 -o ro /dev/loop2 /mnt/asystem 2>/dev/null || true
+ln -sfn /mnt/avendor /system/vendor
+chmod 666 /dev/mali0 /dev/ion /dev/video* /dev/dri/card0 2>/dev/null || true
 while true; do
     sleep 60
 done
