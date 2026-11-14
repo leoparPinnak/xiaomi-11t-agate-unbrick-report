@@ -4,6 +4,7 @@ import glob
 import os
 import pty
 import pyte
+import re
 import select
 import struct
 import subprocess
@@ -88,26 +89,42 @@ def read_sys_info():
     except Exception:
         freqs = "-"
 
-    # GPU utilization from GED / Mali
+    # GPU utilization, frequency & VRAM from GED / Mali / gpufreq
     gpu_pct = 0
-    gpu_pwr = "off"
+    gpu_mhz = 0
+    gpu_pwr = "IDLE"
+    gpu_mb = 0.0
+    gpu_ctx = 0
     ged = rfile("/sys/kernel/ged/hal/gpu_utilization", "")
     if ged:
         try:
-            gpu_pct = int(ged.split()[0])
-        except Exception:
-            pass
-    else:
-        gl = rfile("/sys/module/ged/parameters/gpu_loading", "0")
-        try:
-            gpu_pct = int(gl)
+            gpu_pct = max(gpu_pct, int(ged.split()[0]))
         except Exception:
             pass
     mali = rfile("/proc/mali/utilization", "")
-    if "power" in mali and ":1" in mali.split("power")[-1]:
+    m_util = re.search(r"gpu/cljs0/cljs1=(\d+)/(\d+)/(\d+)", mali)
+    if m_util:
+        gpu_pct = max(gpu_pct, int(m_util.group(1)), int(m_util.group(2)), int(m_util.group(3)))
+    m_pwr = re.search(r"\):(\d+)", mali)
+    if m_pwr and int(m_pwr.group(1)) > 0:
         gpu_pwr = "ON"
-    elif gpu_pct > 0:
+
+    gfreq = rfile("/proc/gpufreq/gpufreq_var_dump", "")
+    mf = re.search(r"\(real\)\s*freq:\s*(\d+)", gfreq)
+    if mf:
+        gpu_mhz = int(mf.group(1)) // 1000
+    mp = re.search(r"g_power_count\s*=\s*(\d+)", gfreq)
+    if mp and int(mp.group(1)) > 0:
         gpu_pwr = "ON"
+
+    mmem = rfile("/proc/mali/memory_usage", "")
+    mm = re.search(r"\((\d+)\s+bytes\)", mmem)
+    if mm:
+        gpu_mb = int(mm.group(1)) / (1024.0 * 1024.0)
+    gpu_ctx = mmem.count("kctx-")
+    if gpu_pct > 0 or gpu_mhz > 0:
+        gpu_pwr = "ON"
+    gpu_desc = f"{gpu_mhz}MHz|{gpu_pwr}|{gpu_mb:.1f}MB|{gpu_ctx}ctx" if gpu_mhz > 0 else f"{gpu_pwr}|{gpu_mb:.1f}MB|{gpu_ctx}ctx"
 
     # Memory
     mem_tot = mem_avail = 0
@@ -175,6 +192,7 @@ def read_sys_info():
         "freqs": freqs,
         "gpu_pct": gpu_pct,
         "gpu_pwr": gpu_pwr,
+        "gpu_desc": gpu_desc,
         "mem_used": mem_used,
         "mem_tot": mem_tot,
         "mem_pct": mem_pct,
@@ -220,7 +238,7 @@ def render_frame():
     draw_bar(d, 680, 97, 340, 24, info["cpu_pct"], c_col)
 
     # GPU bar
-    d.text((38, 135), f"GPU: {info['gpu_pct']:3d}%    (Mali {info['gpu_pwr']})", font=f_sub, fill=(170, 230, 255, 255))
+    d.text((38, 135), f"GPU: {info['gpu_pct']:3d}%  ({info['gpu_desc']})", font=f_sub, fill=(170, 230, 255, 255))
     draw_bar(d, 680, 137, 340, 24, info["gpu_pct"], (80, 190, 255, 255))
 
     # RAM bar
