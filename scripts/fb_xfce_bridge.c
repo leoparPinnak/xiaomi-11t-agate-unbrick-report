@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <linux/videodev2.h>
@@ -56,6 +57,22 @@ typedef struct {
     uint16_t full_w;
     uint16_t full_h;
 } udp_tile_hdr_t;
+
+typedef struct {
+    char magic[4];      /* "AGTM" */
+    uint16_t cpu_x10;
+    uint16_t ram_used_mb;
+    uint16_t ram_total_mb;
+    int16_t  temp_x10;
+    uint8_t  bat_pct;
+    uint8_t  bat_state; /* 0=Discharging, 1=Charging, 2=Stopped@70%, 3=Full */
+    int16_t  bat_ma;    /* signed mA (+ charging, - discharging) */
+    int16_t  bat_temp_x10;
+    uint8_t  screen_on;
+    uint8_t  fb_mirror;
+    uint16_t width;
+    uint16_t height;
+} udp_tel_pkt_t;
 #pragma pack(pop)
 
 static volatile int g_running = 1;
@@ -87,13 +104,54 @@ static inline uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
 }
 
+static void spawn_clean(const char *cmd) {
+    pid_t p = fork();
+    if (p == 0) {
+        setsid();
+        /* Close every inherited fd (UDP socket, /dev/video4, /dev/ion, /dev/fb0) before exec! */
+        for (int fd = 3; fd < 256; fd++) close(fd);
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            if (devnull > 2) close(devnull);
+        }
+        execl("/bin/bash", "bash", "-c", cmd, (char *)NULL);
+        _exit(127);
+    } else if (p > 0) {
+        /* Double fork isn't needed if we ignore SIGCHLD (SA_NOCLDWAIT) */
+    }
+}
+
 static void write_sys(const char *path, const char *val) {
-    int fd = open(path, O_WRONLY);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd >= 0) {
         ssize_t r = write(fd, val, strlen(val));
         (void)r;
         close(fd);
     }
+}
+
+static int read_sys_int(const char *path, int def_val) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return def_val;
+    char buf[64];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return def_val;
+    buf[n] = 0;
+    return atoi(buf);
+}
+
+static int read_sys_str(const char *path, char *out, size_t max_len) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, out, max_len - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    out[n] = 0;
+    return 0;
 }
 
 static void set_screen(int on) {
@@ -111,7 +169,7 @@ static void set_screen(int on) {
 
 static void *power_thread(void *arg) {
     (void)arg;
-    int fd = open("/dev/input/event1", O_RDONLY);
+    int fd = open("/dev/input/event1", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return NULL;
     struct input_event ev;
     while (g_running) {
@@ -132,7 +190,7 @@ static void *fifo_thread(void *arg) {
     mkfifo("/run/fbui.ctl", 0622);
     chmod("/run/fbui.ctl", 0622);
     while (g_running) {
-        int fd = open("/run/fbui.ctl", O_RDONLY);
+        int fd = open("/run/fbui.ctl", O_RDONLY | O_CLOEXEC);
         if (fd < 0) { usleep(200000); continue; }
         char buf[64];
         ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -143,6 +201,95 @@ static void *fifo_thread(void *arg) {
             else if (strstr(buf, "off")) set_screen(0);
             else if (strstr(buf, "toggle")) set_screen(!g_screen_on);
         }
+    }
+    return NULL;
+}
+
+static void *telemetry_thread(void *arg) {
+    (void)arg;
+    uint64_t prev_tot = 0, prev_idle = 0;
+    while (g_running) {
+        sleep(1);
+        pthread_mutex_lock(&g_udp_mu);
+        int has_u = (g_udp_has_cli && g_udp_fd >= 0 && (now_ms() - g_udp_last_hello_ms <= 10000));
+        struct sockaddr_in ucli = g_udp_cli;
+        pthread_mutex_unlock(&g_udp_mu);
+        if (!has_u) continue;
+
+        udp_tel_pkt_t pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        memcpy(pkt.magic, "AGTM", 4);
+
+        /* CPU % */
+        FILE *fp = fopen("/proc/stat", "re");
+        if (fp) {
+            unsigned long long u=0, n=0, s=0, id=0, io=0, irq=0, sirq=0, st=0;
+            if (fscanf(fp, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &u, &n, &s, &id, &io, &irq, &sirq, &st) >= 4) {
+                uint64_t idle = id + io;
+                uint64_t tot = u + n + s + idle + irq + sirq + st;
+                if (prev_tot > 0 && tot > prev_tot) {
+                    uint64_t dt = tot - prev_tot;
+                    uint64_t did = idle - prev_idle;
+                    pkt.cpu_x10 = (uint16_t)(((dt - did) * 1000ULL) / dt);
+                }
+                prev_tot = tot; prev_idle = idle;
+            }
+            fclose(fp);
+        }
+
+        /* RAM MB */
+        FILE *fm = fopen("/proc/meminfo", "re");
+        if (fm) {
+            char k[64]; unsigned long v = 0;
+            unsigned long mem_tot = 0, mem_avail = 0;
+            while (fscanf(fm, "%63s %lu %*[^\n]", k, &v) == 2) {
+                if (strcmp(k, "MemTotal:") == 0) mem_tot = v / 1024;
+                else if (strcmp(k, "MemAvailable:") == 0) mem_avail = v / 1024;
+            }
+            fclose(fm);
+            pkt.ram_total_mb = (uint16_t)mem_tot;
+            pkt.ram_used_mb  = (uint16_t)(mem_tot > mem_avail ? mem_tot - mem_avail : 0);
+        }
+
+        /* CPU/SoC max thermal */
+        int max_t = 0;
+        for (int z = 0; z < 16; z++) {
+            char tp[64];
+            snprintf(tp, sizeof(tp), "/sys/class/thermal/thermal_zone%d/temp", z);
+            int tv = read_sys_int(tp, -1);
+            if (tv > 1000 && tv < 120000) tv /= 100; /* tenths of C */
+            else if (tv > 0 && tv < 120) tv *= 10;
+            else continue;
+            if (tv > max_t) max_t = tv;
+        }
+        pkt.temp_x10 = (int16_t)max_t;
+
+        /* Battery & Charge limit status */
+        int cap = read_sys_int("/sys/class/power_supply/battery/capacity", 0);
+        int susp = read_sys_int("/sys/class/power_supply/battery/input_suspend", 0);
+        int cur_ua = read_sys_int("/sys/class/power_supply/battery/current_now", 0);
+        int btemp = read_sys_int("/sys/class/power_supply/battery/temp", 0);
+        char bstat[32] = {0};
+        read_sys_str("/sys/class/power_supply/battery/status", bstat, sizeof(bstat));
+
+        pkt.bat_pct = (uint8_t)(cap < 0 ? 0 : (cap > 100 ? 100 : cap));
+        if (susp == 1) pkt.bat_state = 2; /* Stopped by 70% cutoff */
+        else if (strstr(bstat, "Charging")) pkt.bat_state = 1;
+        else if (strstr(bstat, "Full")) pkt.bat_state = 3;
+        else pkt.bat_state = 0;
+
+        /* MTK current_now is usually in uA (or tenths of mA) -> clamp to int16 mA */
+        int ma = (abs(cur_ua) > 10000) ? (cur_ua / 1000) : cur_ua;
+        if (ma > 30000) ma = 30000;
+        if (ma < -30000) ma = -30000;
+        pkt.bat_ma = (int16_t)ma;
+        pkt.bat_temp_x10 = (int16_t)btemp;
+        pkt.screen_on = (uint8_t)(g_screen_on ? 1 : 0);
+        pkt.fb_mirror = (uint8_t)(g_fb_mirror ? 1 : 0);
+        pkt.width = (uint16_t)g_xv_w;
+        pkt.height = (uint16_t)g_xv_h;
+
+        sendto(g_udp_fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&ucli, sizeof(ucli));
     }
     return NULL;
 }
@@ -188,7 +335,7 @@ static void *touch_thread(void *arg) {
 
     int fd = -1;
     for (int i = 0; i < 20 && g_running; i++) {
-        fd = open("/dev/input/event4", O_RDONLY);
+        fd = open("/dev/input/event4", O_RDONLY | O_CLOEXEC);
         if (fd >= 0) break;
         usleep(200000);
     }
@@ -293,40 +440,37 @@ static void *udp_rx_thread(void *arg) {
     const char *disp_name = (const char *)arg;
     void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
     void *hxtst = dlopen("libXtst.so.6", RTLD_NOW);
-    if (!hx11 || !hxtst) return NULL;
-
-    void *(*pXOpenDisplay)(const char *) = dlsym(hx11, "XOpenDisplay");
-    int (*pXFlush)(void *) = dlsym(hx11, "XFlush");
-    int (*pXSync)(void *, int) = dlsym(hx11, "XSync");
-    unsigned int (*pXKeysymToKeycode)(void *, unsigned long) = dlsym(hx11, "XKeysymToKeycode");
-    unsigned long (*pXStringToKeysym)(const char *) = dlsym(hx11, "XStringToKeysym");
-    int (*pXChangeKeyboardMapping)(void *, int, int, unsigned long *, int) = dlsym(hx11, "XChangeKeyboardMapping");
-    int (*pXTestMotion)(void *, int, int, int, unsigned long) = dlsym(hxtst, "XTestFakeMotionEvent");
-    int (*pXTestBtn)(void *, unsigned int, int, unsigned long) = dlsym(hxtst, "XTestFakeButtonEvent");
-    int (*pXTestKey)(void *, unsigned int, int, unsigned long) = dlsym(hxtst, "XTestFakeKeyEvent");
+    void *(*pXOpenDisplay)(const char *) = hx11 ? dlsym(hx11, "XOpenDisplay") : NULL;
+    int (*pXFlush)(void *) = hx11 ? dlsym(hx11, "XFlush") : NULL;
+    int (*pXSync)(void *, int) = hx11 ? dlsym(hx11, "XSync") : NULL;
+    unsigned int (*pXKeysymToKeycode)(void *, unsigned long) = hx11 ? dlsym(hx11, "XKeysymToKeycode") : NULL;
+    unsigned long (*pXStringToKeysym)(const char *) = hx11 ? dlsym(hx11, "XStringToKeysym") : NULL;
+    int (*pXChangeKeyboardMapping)(void *, int, int, unsigned long *, int) = hx11 ? dlsym(hx11, "XChangeKeyboardMapping") : NULL;
+    int (*pXTestMotion)(void *, int, int, int, unsigned long) = hxtst ? dlsym(hxtst, "XTestFakeMotionEvent") : NULL;
+    int (*pXTestBtn)(void *, unsigned int, int, unsigned long) = hxtst ? dlsym(hxtst, "XTestFakeButtonEvent") : NULL;
+    int (*pXTestKey)(void *, unsigned int, int, unsigned long) = hxtst ? dlsym(hxtst, "XTestFakeKeyEvent") : NULL;
 
     void *dpy = NULL;
-    for (int i = 0; i < 50 && g_running; i++) {
-        dpy = pXOpenDisplay(disp_name);
-        if (dpy) break;
-        usleep(100000);
-    }
-    if (!dpy) return NULL;
-
-    for (int i = 0; i < 6; i++) {
-        unsigned long arr[2] = { g_tr_map[i].lo, g_tr_map[i].hi };
-        pXChangeKeyboardMapping(dpy, (int)g_tr_map[i].kc, 2, arr, 1);
-    }
-    pXSync(dpy, 0);
-
-    unsigned int kc_ctrl  = pXKeysymToKeycode(dpy, 0xFFE3);
-    unsigned int kc_alt   = pXKeysymToKeycode(dpy, 0xFFE9);
-    unsigned int kc_shift = pXKeysymToKeycode(dpy, 0xFFE1);
-    unsigned int kc_meta  = pXKeysymToKeycode(dpy, 0xFFEB);
+    unsigned int kc_ctrl = 0, kc_alt = 0, kc_shift = 0, kc_meta = 0;
 
     uint8_t buf[2048];
     struct sockaddr_in from;
     while (g_running && g_udp_fd >= 0) {
+        if (!dpy && pXOpenDisplay) {
+            dpy = pXOpenDisplay(disp_name);
+            if (dpy) {
+                for (int i = 0; i < 6; i++) {
+                    unsigned long arr[2] = { g_tr_map[i].lo, g_tr_map[i].hi };
+                    pXChangeKeyboardMapping(dpy, (int)g_tr_map[i].kc, 2, arr, 1);
+                }
+                pXSync(dpy, 0);
+                kc_ctrl  = pXKeysymToKeycode(dpy, 0xFFE3);
+                kc_alt   = pXKeysymToKeycode(dpy, 0xFFE9);
+                kc_shift = pXKeysymToKeycode(dpy, 0xFFE1);
+                kc_meta  = pXKeysymToKeycode(dpy, 0xFFEB);
+            }
+        }
+
         socklen_t flen = sizeof(from);
         ssize_t n = recvfrom(g_udp_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
         if (n < 4) { usleep(5000); continue; }
@@ -354,7 +498,7 @@ static void *udp_rx_thread(void *arg) {
         if (memcmp(buf, "AGTI", 4) != 0 || n < 5) continue;
         uint8_t kind = buf[4];
 
-        if (kind == 1 && n >= 11) {
+        if (kind == 1 && n >= 11 && dpy && pXTestMotion && pXTestBtn) {
             uint8_t act = buf[5];
             uint8_t btn = buf[6];
             int16_t mx = (int16_t)(buf[7] | (buf[8] << 8));
@@ -368,7 +512,7 @@ static void *udp_rx_thread(void *arg) {
             else if (act == 2) pXTestBtn(dpy, btn, 0, 0);
             else if (act == 3) { pXTestBtn(dpy, btn, 1, 0); pXTestBtn(dpy, btn, 0, 0); }
             pXFlush(dpy);
-        } else if (kind == 2 && n >= 10) {
+        } else if (kind == 2 && n >= 10 && dpy && pXTestKey) {
             uint8_t mods = buf[5];
             uint32_t ks = (uint32_t)buf[6] | ((uint32_t)buf[7] << 8) | ((uint32_t)buf[8] << 16) | ((uint32_t)buf[9] << 24);
             unsigned int kc = pXKeysymToKeycode(dpy, (unsigned long)ks);
@@ -385,7 +529,7 @@ static void *udp_rx_thread(void *arg) {
                 if ((mods & 1) && kc_ctrl)  pXTestKey(dpy, kc_ctrl, 0, 0);
                 pXFlush(dpy);
             }
-        } else if (kind == 3 && n >= 7) {
+        } else if (kind == 3 && n >= 7 && dpy && pXTestKey) {
             uint16_t tlen = (uint16_t)(buf[5] | (buf[6] << 8));
             if (7 + tlen > n) tlen = (uint16_t)(n - 7);
             size_t i = 0;
@@ -430,20 +574,20 @@ static void *udp_rx_thread(void *arg) {
                 snprintf(sc, sizeof(sc),
                     "su - ubuntu -c \"DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage "
                     "--new-window --window-size=%d,%d --window-position=0,28 --user-data-dir=/home/ubuntu/.config/chr_xfce "
-                    "https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &\" &", g_xv_w, g_xv_h > 80 ? g_xv_h - 80 : 600);
-                int r = system(sc); (void)r;
+                    "https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &\"", g_xv_w, g_xv_h > 80 ? g_xv_h - 80 : 600);
+                spawn_clean(sc);
             } else if (cmd == 2) {
-                int r = system("su - ubuntu -c \"DISPLAY=:0 nohup xfce4-terminal --geometry=120x32+80+60 >/tmp/term_xfce.log 2>&1 &\" &"); (void)r;
+                spawn_clean("su - ubuntu -c \"DISPLAY=:0 nohup xfce4-terminal --geometry=120x32+80+60 >/tmp/term_xfce.log 2>&1 &\"");
             } else if (cmd == 3) {
-                int r = system("su - ubuntu -c \"DISPLAY=:0 nohup thunar /home/ubuntu >/tmp/thunar_xfce.log 2>&1 &\" &"); (void)r;
+                spawn_clean("su - ubuntu -c \"DISPLAY=:0 nohup thunar /home/ubuntu >/tmp/thunar_xfce.log 2>&1 &\"");
             } else if (cmd == 5) {
-                int r = system("/usr/local/bin/ekran xfce yatay &"); (void)r;
+                spawn_clean("/usr/local/bin/ekran xfce yatay");
             } else if (cmd == 6) {
-                int r = system("/usr/local/bin/ekran xfce dikey &"); (void)r;
+                spawn_clean("/usr/local/bin/ekran xfce dikey");
             } else if (cmd == 7) {
-                int r = system("/usr/local/bin/ekran xfce 4k &"); (void)r;
+                spawn_clean("/usr/local/bin/ekran xfce 4k");
             } else if (cmd == 8) {
-                int r = system("/usr/local/bin/ekran xfce 1080p &"); (void)r;
+                spawn_clean("/usr/local/bin/ekran xfce 1080p");
             }
         }
     }
@@ -556,6 +700,7 @@ static int ion_alloc_buf(int ion_fd, size_t sz, int *out_h, int *out_fd, uint8_t
     if (ioctl(ion_fd, ION_IOC_ALLOC, &ad) < 0) return -1;
     struct mtk_ion_fd_data fd_d = { .handle = ad.handle, .fd = -1 };
     if (ioctl(ion_fd, ION_IOC_SHARE, &fd_d) < 0) return -1;
+    fcntl(fd_d.fd, F_SETFD, FD_CLOEXEC);
     void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd_d.fd, 0);
     if (m == MAP_FAILED) return -1;
     *out_h = ad.handle; *out_fd = fd_d.fd; *out_map = (uint8_t *)m;
@@ -565,8 +710,8 @@ static int ion_alloc_buf(int ion_fd, size_t sz, int *out_h, int *out_fd, uint8_t
 static int hwjpeg_init(hwjpeg_ctx *c, int tw, int th) {
     memset(c, 0, sizeof(*c));
     c->tw = tw; c->th = th;
-    c->ion_fd = open("/dev/ion", O_RDWR);
-    c->vfd = open("/dev/video4", O_RDWR);
+    c->ion_fd = open("/dev/ion", O_RDWR | O_CLOEXEC);
+    c->vfd = open("/dev/video4", O_RDWR | O_CLOEXEC);
     if (c->ion_fd < 0 || c->vfd < 0) return -1;
 
     struct v4l2_control ctrl = { .id = V4L2_CID_JPEG_COMPRESSION_QUALITY, .value = 82 };
@@ -724,10 +869,14 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sig);
     signal(SIGINT, on_sig);
     signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa = {0};
+    sa.sa_handler = SIG_IGN;
+    sa.sa_flags = SA_NOCLDWAIT;
+    sigaction(SIGCHLD, &sa, NULL);
 
     int xfd = -1;
     for (int i = 0; i < 60 && g_running; i++) {
-        xfd = open(XWD_PATH, O_RDONLY);
+        xfd = open(XWD_PATH, O_RDONLY | O_CLOEXEC);
         if (xfd >= 0) break;
         usleep(100000);
     }
@@ -764,7 +913,7 @@ int main(int argc, char **argv) {
     size_t fb_bytes = (size_t)FB_STRIDE_PX * FB_H * 4;
 
     if (g_fb_mirror) {
-        fbfd = open("/dev/fb0", O_RDWR);
+        fbfd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
         if (fbfd >= 0) {
             fb_map = mmap(NULL, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
             ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
@@ -779,8 +928,10 @@ int main(int argc, char **argv) {
     uint32_t *composed = malloc(frame_bytes);
     g_enc_buf = malloc(frame_bytes);
 
-    g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    g_udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (g_udp_fd >= 0) {
+        int reuse = 1;
+        setsockopt(g_udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         int sb = 8 * 1024 * 1024, rb = 1 * 1024 * 1024;
         setsockopt(g_udp_fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
         setsockopt(g_udp_fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
@@ -804,12 +955,15 @@ int main(int argc, char **argv) {
     my_XFixesCursorImage *(*pGetCursor)(void *) = hxfix ? dlsym(hxfix, "XFixesGetCursorImage") : NULL;
     void *cur_dpy = pXOpenDisplay ? pXOpenDisplay(disp) : NULL;
 
-    pthread_t th_pwr, th_fifo, th_tch, th_enc, th_urx;
+    pthread_t th_pwr, th_fifo, th_tch, th_enc, th_urx, th_tel;
     pthread_create(&th_pwr, NULL, power_thread, NULL);
     pthread_create(&th_fifo, NULL, fifo_thread, NULL);
     pthread_create(&th_tch, NULL, touch_thread, (void *)disp);
     pthread_create(&th_enc, NULL, enc_thread, NULL);
-    if (g_udp_fd >= 0) pthread_create(&th_urx, NULL, udp_rx_thread, (void *)disp);
+    if (g_udp_fd >= 0) {
+        pthread_create(&th_urx, NULL, udp_rx_thread, (void *)disp);
+        pthread_create(&th_tel, NULL, telemetry_thread, NULL);
+    }
 
     uint64_t last_enc_ms = 0;
     int prev_cx = -999, prev_cy = -999;

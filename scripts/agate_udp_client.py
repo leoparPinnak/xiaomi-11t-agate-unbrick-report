@@ -45,6 +45,7 @@ QT_KEY_TO_KEYSYM = {
 class UdpSignals(QObject):
     tile_ready = Signal(int, int, int, int, QImage)  # tx, ty, full_w, full_h, tile_img
     stats_ready = Signal(int, int, float, int, int)  # fps, kbps, loss_pct, w, h
+    telemetry_ready = Signal(float, int, int, float, int, int, int, float, int, int)  # cpu, ram_u, ram_t, temp, bat_pct, bat_state, bat_ma, bat_temp, scr_on, fb_mir
 
 
 class UdpTransport:
@@ -155,6 +156,18 @@ class UdpTransport:
                 if 200 <= w <= 4096 and 200 <= h <= 4096:
                     self.remote_w = w
                     self.remote_h = h
+                continue
+
+            if len(pkt) >= 24 and pkt[:4] == b"AGTM":
+                cpu_x10, ram_u, ram_t, temp_x10, bpct, bstat, bma, bt_x10, son, fbm, w, h = struct.unpack(
+                    "<HHHhBBhhBBHH", pkt[4:24]
+                )
+                if 200 <= w <= 4096 and 200 <= h <= 4096:
+                    self.remote_w, self.remote_h = w, h
+                self.signals.telemetry_ready.emit(
+                    cpu_x10 / 10.0, ram_u, ram_t, temp_x10 / 10.0,
+                    bpct, bstat, bma, bt_x10 / 10.0, son, fbm
+                )
                 continue
 
             if len(pkt) >= 24 and pkt[:4] == b"AGTT":
@@ -336,6 +349,9 @@ class MainWindow(QMainWindow):
 
         self.lbl_stat = QLabel("UDP FPS: -- | -- KB/s | Kayıp: 0.0% | 3840×2160")
         self.lbl_stat.setObjectName("pill")
+        self.lbl_tel = QLabel("CPU --% · RAM --MB · --°C · Bat --% · Ekran: --")
+        self.lbl_tel.setObjectName("pill")
+        self.lbl_tel.setStyleSheet("background:#10221c; border:1px solid #1f5c43; color:#7ef0be; border-radius:9px; padding:2px 8px; font-family:Consolas,monospace; font-size:11px;")
 
         btn_chr = QPushButton("🌐 Chromium")
         btn_chr.clicked.connect(lambda: self.transport.send_cmd(1))
@@ -360,6 +376,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.ip_edit)
         bar.addWidget(btn_conn)
         bar.addWidget(self.lbl_stat)
+        bar.addWidget(self.lbl_tel)
         bar.addStretch(1)
         for b in (btn_chr, btn_term, btn_files, btn_4k, btn_1080, btn_scr, btn_land, btn_port, btn_fs):
             bar.addWidget(b)
@@ -391,6 +408,7 @@ class MainWindow(QMainWindow):
 
         self.signals.tile_ready.connect(self.canvas.set_tile)
         self.signals.stats_ready.connect(self.on_stats)
+        self.signals.telemetry_ready.connect(self.on_telemetry)
 
         self.reconnect()
         self.canvas.setFocus()
@@ -414,6 +432,20 @@ class MainWindow(QMainWindow):
 
     def on_stats(self, fps: int, kbps: int, loss: float, w: int, h: int):
         self.lbl_stat.setText(f"UDP FPS: {fps} | {kbps} KB/s | Kayıp: {loss:.1f}% | {w}×{h}")
+
+    def on_telemetry(self, cpu: float, ram_u: int, ram_t: int, temp: float, bat_pct: int, bat_state: int, bat_ma: int, bat_temp: float, scr_on: int, fb_mir: int):
+        if bat_state == 2:
+            btxt = f"⛔%{bat_pct} (%70 Durduruldu)"
+        elif bat_state == 1:
+            btxt = f"⚡%{bat_pct} (+{abs(bat_ma)}mA)"
+        elif bat_state == 3:
+            btxt = f"✅%{bat_pct} (Dolu)"
+        else:
+            btxt = f"🔋%{bat_pct} ({bat_ma}mA)"
+        stxt = "AÇIK" if scr_on else ("DONDURULDU" if not fb_mir else "KAPALI")
+        self.lbl_tel.setText(
+            f"CPU {cpu:.1f}% · RAM {ram_u}/{ram_t}MB · {temp:.1f}°C · {btxt} ({bat_temp:.1f}°C) · Ekran:{stxt}"
+        )
 
     def toggle_fs(self):
         if self.isFullScreen():
