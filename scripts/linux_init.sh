@@ -91,6 +91,10 @@ mount -t ext4 -o ro /dev/loop1 /mnt/avendor 2>/dev/null || true
 mount -t ext4 -o ro /dev/loop2 /mnt/asystem 2>/dev/null || true
 ln -sfn /mnt/avendor /system/vendor
 chmod 666 /dev/mali0 /dev/ion /dev/video* /dev/dri/card0 2>/dev/null || true
+insmod /mnt/avendor/lib/modules/xiaomi_touch.ko 2>/dev/null || true
+insmod /mnt/avendor/lib/modules/fts_touch_spi.ko 2>/dev/null || true
+busybox mdev -s 2>/dev/null || true
+chmod 666 /dev/null /dev/zero /dev/urandom /dev/tty /dev/ptmx /dev/mali0 /dev/ion /dev/video* /dev/dri/card0 2>/dev/null || true
 while true; do
     sleep 60
 done

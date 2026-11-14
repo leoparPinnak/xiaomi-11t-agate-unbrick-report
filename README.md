@@ -265,6 +265,20 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - Encode modu / kalite seçici: **`HW-JPEG 1080p (/dev/video3)`** (varsayılan), **`Native 1080p (Kayıpsız PNG)`**, **`2K QHD 1440p`** ve **`4K UHD 2160p (Kayıpsız PNG)`**.
    - Tek tıkla **`GPU: MAX 886MHz` / `AUTO`** (`scripts/gpu-perf.sh`) anahtarı ve alt kısımda 6 kartlı canlı telefon telemetrisi (CPU, GPU/VRAM, RAM, 5 sıcaklık, Batarya/Güç/Şarj Limiti, Akış).
 
+### Adım 17: Telefon Ekranına Dokunmatik XFCE4 Masaüstü ve Chromium Basılması (`ekran xfce`)
+1. **Dokunmatik Ekran Sürücülerinin Yüklenmesi (`/dev/input/event4`):**
+   - `/mnt/avendor/lib/modules/` içindeki **`xiaomi_touch.ko`** ve **`fts_touch_spi.ko`** çekirdek modülleri yüklenerek FocalTech dokunmatik ekran (`/dev/input/event4`, `fts`, `0..10799 × 0..23999` çözünürlük) aktifleştirildi ve `/sbin/linux_init` açılışına kalıcı eklendi.
+2. **Minimal XFCE4 & Xvfb → `/dev/fb0` Köprüsü (`scripts/fb_xfce_bridge.c`):**
+   - `--no-install-recommends` ile minimal **XFCE4** (`xfwm4`, `xfce4-panel`, `xfce4-session`, `xfdesktop4`, `xfce4-terminal`, `thunar`, `Xvfb`) kuruldu (`~44 MB`, `/` diskte `447 MB` boş).
+   - MediaTek `/dev/fb0` `FBIOPAN_DISPLAY` ve `stride=4352` (`1088` genişlik) gerektirdiği için **`fb_xfce_bridge.c`** (`/usr/local/sbin/fb_xfce_bridge`) yazıldı:
+     - `Xvfb :0` (`1080×2400`) bellek tamponunu (`BGRX → RGBA`) değişen satırlarda 30 FPS olarak `/dev/fb0`'a basar.
+     - `/dev/input/event4` dokunmatik olaylarını `libXtst` (`XTestFakeMotionEvent` / `XTestFakeButtonEvent`) ile doğrudan X11 tıklama/sürüklemeye çevirir.
+     - `/dev/input/event1` (`KEY_POWER`) ve `/run/fbui.ctl` FIFO ile ekran ışığı açma/kapatma özelliğini korur.
+3. **Çift Modlu Ekran Kontrolü (`scripts/ekran.sh`, `scripts/start_xfce_fb.sh`):**
+   - `sudo ekran xfce`: XFCE4 masaüstünü ve üzerinde dokunmatik **Chromium** penceresini telefon ekranına (`1080×2400`) basar (masaüstünde `Chromium Web` kısayolu hazır).
+   - `sudo ekran terminal`: Eski hafif telemetri + `tmux` terminal dashboard'una (`fbui.py`) geri döner.
+   - `sudo ekran ac | kapat | toggle`: Güç tuşuyla aynı şekilde ekranı açar/kapatır.
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -285,7 +299,8 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/setup_ubuntu.sh` | Android üzerinde 32 GB sparse `ext4` loop imajına Ubuntu 22.04 kurulumu |
 | `scripts/build_native_boot.py` | Stok `kernel` + `dtb` + statik `busybox` `initramfs` ile Android'siz `boot.img` üreticisi |
 | `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı + `%67–%70` şarj kesici |
-| `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `pyte`/`tmux` terminal + Güç tuşu ekran aç/kapa |
+| `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `ekran xfce | terminal` mod anahtarı |
+| `scripts/fb_xfce_bridge.c` & `scripts/start_xfce_fb.sh` | `Xvfb :0` → `/dev/fb0` + `fts` dokunmatik (`/dev/input/event4`) + Güç tuşu XFCE köprüsü |
 | `scripts/libhybris_mali_agate.patch` | `libhybris` Mali-G77 MC9 (`Android 11` / `MT6893` `/dev/ion` & ANGLE) tam yaması |
 | `scripts/weston_hwjpeg.c` | Weston C modülü: ARM64 NEON + ION `0x400` + `/dev/video3` donanım JPEG akış eklentisi |
 | `scripts/hwjpeg_v4l2.c` | `/dev/video3` & `/dev/video4` ION `0x400` V4L2 DMABUF donanım JPEG kütüphanesi (`/usr/local/lib/libhwjpeg.so`) |
@@ -298,7 +313,7 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 ## 6. Durum Özeti
 
 - **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
-- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — **USB RNDIS**, **Wi-Fi (`192.168.2.212:2222`)**, **`%67–%70` şarj kesici**, **`/dev/fb0` telemetri dashboard'u**, **Mali-G77 MC9 GPU (`886 MHz`) hızlandırmalı Chromium 156** ve **`weston_hwjpeg.so` (`/dev/video3` donanım JPEG @ ~29 FPS 1080p)** aktif.
+- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — **USB RNDIS**, **Wi-Fi (`192.168.2.212:2222`)**, **`%67–%70` şarj kesici**, **dokunmatik XFCE4 masaüstü + Chromium (`ekran xfce`) / telemetri dashboard (`ekran terminal`)**, **Mali-G77 MC9 GPU (`886 MHz`) hızlandırmalı Chromium 156** ve **`weston_hwjpeg.so` (`/dev/video3` donanım JPEG @ ~29 FPS 1080p)** aktif.
 - **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır.
 
 ---
