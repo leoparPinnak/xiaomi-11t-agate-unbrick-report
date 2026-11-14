@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import time
+from urllib.parse import quote
 import aiohttp
 from aiohttp import web
 
@@ -17,18 +18,17 @@ XDG_DIR = "/tmp/xdg_chrome_rt"
 
 active_target_id = None
 latest_frame = None
-frame_seq = 0
+last_frame_ts = 0.0
 frame_event = asyncio.Event()
 ws_clients = set()
 
 stream_cfg = {
     "quality": 65,
-    "everyNthFrame": 3,
+    "everyNthFrame": 1,
     "maxWidth": 1280,
     "maxHeight": 720,
 }
 
-# CPU delta tracker
 _prev_cpu = None
 _cached_cpu_pct = 0.0
 
@@ -70,7 +70,6 @@ def collect_telemetry():
         freqs.append(int(v) // 1000 if v.isdigit() else 0)
     gov = _rfile("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", "-")
 
-    # GPU
     gpu_pct = 0
     gpu_mhz = 0
     gpu_pwr = "IDLE"
@@ -113,7 +112,6 @@ def collect_telemetry():
     opp_txt = _rfile("/proc/gpufreq/gpufreq_opp_freq", "")
     gpu_max_mode = "fixed OPP is enabled" in opp_txt
 
-    # RAM
     mem_tot = mem_avail = swap_tot = swap_free = 0
     for l in _rfile("/proc/meminfo").splitlines():
         if l.startswith("MemTotal:"):
@@ -126,7 +124,6 @@ def collect_telemetry():
             swap_free = int(l.split()[1]) // 1024
     mem_used = max(0, mem_tot - mem_avail)
 
-    # Temps
     temps = {}
     for z in glob.glob("/sys/class/thermal/thermal_zone*"):
         tn = _rfile(os.path.join(z, "type"))
@@ -139,7 +136,6 @@ def collect_telemetry():
             except Exception:
                 pass
 
-    # Battery & power
     cap = _rfile("/sys/class/power_supply/battery/capacity", "0")
     stat = _rfile("/sys/class/power_supply/battery/status", "?")
     susp = _rfile("/sys/class/power_supply/battery/input_suspend", "0")
@@ -186,13 +182,17 @@ def collect_telemetry():
     }
 
 
-async def cdp_send(method, params=None):
+async def cdp_send(method, params=None, fixed_id=None):
     global cmd_id
     async with cdp_lock:
         if active_ws is None or active_ws.closed:
             return False
-        cmd_id += 1
-        await active_ws.send_json({"id": cmd_id, "method": method, "params": params or {}})
+        if fixed_id is None:
+            cmd_id += 1
+            mid = cmd_id
+        else:
+            mid = fixed_id
+        await active_ws.send_json({"id": mid, "method": method, "params": params or {}})
         return True
 
 
@@ -205,22 +205,28 @@ async def fetch_pages():
         return []
 
 
-async def broadcast_frame(raw_bytes):
-    dead = []
+async def _send_one_ws(ws, raw_bytes):
+    try:
+        await asyncio.wait_for(ws.send_bytes(raw_bytes), timeout=0.4)
+    except Exception:
+        ws_clients.discard(ws)
+
+
+def publish_frame(raw_bytes):
+    global latest_frame, last_frame_ts
+    latest_frame = raw_bytes
+    last_frame_ts = time.monotonic()
+    frame_event.set()
+    frame_event.clear()
     for ws in list(ws_clients):
         if ws.closed:
-            dead.append(ws)
-            continue
-        try:
-            await ws.send_bytes(raw_bytes)
-        except Exception:
-            dead.append(ws)
-    for d in dead:
-        ws_clients.discard(d)
+            ws_clients.discard(ws)
+        else:
+            asyncio.create_task(_send_one_ws(ws, raw_bytes))
 
 
 async def attach_to_tab(target_id=None):
-    global active_target_id, active_ws, reader_task, latest_frame, frame_seq
+    global active_target_id, active_ws, reader_task
 
     pages = await fetch_pages()
     if not pages:
@@ -238,7 +244,6 @@ async def attach_to_tab(target_id=None):
     if chosen["id"] == active_target_id and active_ws is not None and not active_ws.closed:
         return True
 
-    # Detach previous
     if reader_task and not reader_task.done():
         reader_task.cancel()
         try:
@@ -253,9 +258,8 @@ async def attach_to_tab(target_id=None):
             pass
 
     active_target_id = chosen["id"]
-    # Bring target to front inside Chromium
     try:
-        async with active_sess.get(f"http://127.0.0.1:{CDP_PORT}/json/activate/{active_target_id}") as _:
+        async with active_sess.get(f"http://127.0.0.1:{CDP_PORT}/json/activate/{active_target_id}", timeout=aiohttp.ClientTimeout(total=1.5)) as _:
             pass
     except Exception:
         pass
@@ -263,7 +267,6 @@ async def attach_to_tab(target_id=None):
     active_ws = await active_sess.ws_connect(chosen["webSocketDebuggerUrl"], max_msg_size=16 * 1024 * 1024)
 
     async def _read_loop(ws):
-        global latest_frame, frame_seq
         try:
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -271,20 +274,11 @@ async def attach_to_tab(target_id=None):
                 data = json.loads(msg.data)
                 if data.get("method") == "Page.screencastFrame":
                     params = data["params"]
-                    raw = base64.b64decode(params["data"])
-                    latest_frame = raw
-                    frame_seq += 1
-                    frame_event.set()
-                    frame_event.clear()
-                    await broadcast_frame(raw)
+                    # Ack first so Chromium never stalls waiting on our network writes
                     await cdp_send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
+                    publish_frame(base64.b64decode(params["data"]))
                 elif data.get("id") == 900001 and "result" in data and "data" in data["result"]:
-                    raw = base64.b64decode(data["result"]["data"])
-                    latest_frame = raw
-                    frame_seq += 1
-                    frame_event.set()
-                    frame_event.clear()
-                    await broadcast_frame(raw)
+                    publish_frame(base64.b64decode(data["result"]["data"]))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -292,6 +286,7 @@ async def attach_to_tab(target_id=None):
 
     reader_task = asyncio.create_task(_read_loop(active_ws))
     await cdp_send("Page.enable")
+    await cdp_send("Page.bringToFront")
     await cdp_send("Page.stopScreencast")
     await cdp_send("Emulation.setDeviceMetricsOverride", {
         "width": 1920, "height": 1080, "deviceScaleFactor": 1, "mobile": False
@@ -303,14 +298,9 @@ async def attach_to_tab(target_id=None):
         "maxHeight": stream_cfg["maxHeight"],
         "everyNthFrame": stream_cfg["everyNthFrame"],
     })
-    # Immediate snapshot so static pages show up instantly on tab switch
-    async with cdp_lock:
-        if active_ws and not active_ws.closed:
-            await active_ws.send_json({
-                "id": 900001,
-                "method": "Page.captureScreenshot",
-                "params": {"format": "jpeg", "quality": stream_cfg["quality"]},
-            })
+    await cdp_send("Page.captureScreenshot", {
+        "format": "jpeg", "quality": stream_cfg["quality"]
+    }, fixed_id=900001)
     return True
 
 
@@ -323,6 +313,56 @@ async def restart_screencast():
         "maxHeight": stream_cfg["maxHeight"],
         "everyNthFrame": stream_cfg["everyNthFrame"],
     })
+
+
+async def launch_chromium_clean():
+    chrome_env = {
+        **os.environ,
+        "XDG_RUNTIME_DIR": XDG_DIR,
+        "WAYLAND_DISPLAY": "wayland-1",
+        "LD_LIBRARY_PATH": "/usr/local/hybris/lib",
+        "HYBRIS_LD_LIBRARY_PATH": (
+            "/mnt/avendor/lib64:/mnt/avendor/lib64/egl:/mnt/avendor/lib64/hw:"
+            "/mnt/asystem/system/lib64:/mnt/asystem/system/lib64/bootstrap:"
+            "/apex/com.android.runtime/lib64/bionic"
+        ),
+        "HYBRIS_EGLPLATFORM": "wayland",
+        "LIBEGL": "/mnt/avendor/lib64/egl/libGLES_mali.so",
+        "LIBGLESV2": "/mnt/avendor/lib64/egl/libGLES_mali.so",
+        "DBUS_SESSION_BUS_ADDRESS": "disabled:",
+    }
+    subprocess.Popen(
+        [
+            "/usr/bin/chromium",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--ozone-platform=wayland",
+            "--use-gl=angle",
+            "--use-angle=gles",
+            "--disable-vulkan",
+            "--disable-features=Vulkan,Translate,OptimizationHints,MediaRouter,InterestCohort",
+            "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization",
+            "--enable-webgl",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            f"--remote-debugging-port={CDP_PORT}",
+            "--remote-allow-origins=*",
+            "--window-size=1920,1080",
+            f"--user-data-dir={USER_DIR}",
+            "https://www.google.com/",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=chrome_env,
+    )
 
 
 async def cdp_supervisor():
@@ -350,57 +390,10 @@ async def cdp_supervisor():
                 break
             await asyncio.sleep(0.1)
 
-    chrome_env = {
-        **os.environ,
-        "XDG_RUNTIME_DIR": XDG_DIR,
-        "WAYLAND_DISPLAY": "wayland-1",
-        "LD_LIBRARY_PATH": "/usr/local/hybris/lib",
-        "HYBRIS_LD_LIBRARY_PATH": (
-            "/mnt/avendor/lib64:/mnt/avendor/lib64/egl:/mnt/avendor/lib64/hw:"
-            "/mnt/asystem/system/lib64:/mnt/asystem/system/lib64/bootstrap:"
-            "/apex/com.android.runtime/lib64/bionic"
-        ),
-        "HYBRIS_EGLPLATFORM": "wayland",
-        "LIBEGL": "/mnt/avendor/lib64/egl/libGLES_mali.so",
-        "LIBGLESV2": "/mnt/avendor/lib64/egl/libGLES_mali.so",
-        "DBUS_SESSION_BUS_ADDRESS": "disabled:",
-    }
-
     active_sess = aiohttp.ClientSession()
     pages = await fetch_pages()
     if not pages:
-        subprocess.Popen(
-            [
-                "/usr/bin/chromium",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--ozone-platform=wayland",
-                "--use-gl=angle",
-                "--use-angle=gles",
-                "--disable-vulkan",
-                "--disable-features=Vulkan,Translate,OptimizationHints,MediaRouter,InterestCohort",
-                "--ignore-gpu-blocklist",
-                "--enable-gpu-rasterization",
-                "--enable-webgl",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-infobars",
-                "--password-store=basic",
-                "--use-mock-keychain",
-                f"--remote-debugging-port={CDP_PORT}",
-                "--remote-allow-origins=*",
-                "--window-size=1920,1080",
-                f"--user-data-dir={USER_DIR}",
-                "https://webglsamples.org/aquarium/aquarium.html",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=chrome_env,
-        )
+        await launch_chromium_clean()
         for _ in range(40):
             pages = await fetch_pages()
             if pages:
@@ -409,11 +402,22 @@ async def cdp_supervisor():
 
     await attach_to_tab()
 
-    # Keep alive / auto-reattach if tab closes
+    # Keepalive + fallback frame pump if static page hasn't repainted
     while True:
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
         if active_ws is None or active_ws.closed:
+            pages = await fetch_pages()
+            if not pages:
+                await launch_chromium_clean()
+                await asyncio.sleep(2.0)
             await attach_to_tab()
+        elif time.monotonic() - last_frame_ts > 1.2 and ws_clients:
+            try:
+                await cdp_send("Page.captureScreenshot", {
+                    "format": "jpeg", "quality": stream_cfg["quality"]
+                }, fixed_id=900001)
+            except Exception:
+                pass
 
 
 HTML = r"""<!doctype html>
@@ -424,16 +428,15 @@ HTML = r"""<!doctype html>
 <title>Xiaomi 11T · Mali-G77 Cloud Browser Console</title>
 <style>
   :root {
-    --bg: #090d13;
-    --surface: #101720;
-    --surface2: #17202c;
-    --surface3: #1e2a39;
-    --border: #253345;
+    --bg: #080b10;
+    --surface: #101722;
+    --surface2: #16202e;
+    --surface3: #1e2b3d;
+    --border: #253447;
     --text: #e6eef8;
     --muted: #8496ad;
     --accent: #00e599;
     --accent2: #38bdf8;
-    --warn: #f59e0b;
     --danger: #ef4444;
   }
   * { box-sizing: border-box; }
@@ -442,63 +445,58 @@ HTML = r"""<!doctype html>
     font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     overflow: hidden;
   }
-  .app { display: flex; flex-direction: column; height: 100vh; }
+  .app { display: flex; flex-direction: column; height: 100vh; width: 100vw; }
 
-  /* Top Tab Strip */
+  /* Tab Bar */
   .tabbar {
     display: flex; align-items: center; gap: 6px;
-    padding: 7px 12px 0 12px;
-    background: #070a0f;
+    padding: 6px 10px 0 10px;
+    background: #06090d;
     border-bottom: 1px solid var(--border);
-    overflow-x: auto; scrollbar-width: none;
+    flex-shrink: 0;
   }
-  .tabbar::-webkit-scrollbar { display: none; }
   .brand {
-    display: flex; align-items: center; gap: 7px; padding: 5px 10px 8px 4px;
-    font-size: 12px; font-weight: 700; letter-spacing: .4px; color: var(--accent);
+    display: flex; align-items: center; gap: 6px; padding: 4px 8px 6px 2px;
+    font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--accent);
     white-space: nowrap;
   }
   .brand-dot {
-    width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
     box-shadow: 0 0 8px var(--accent);
   }
-  .tabs-wrap { display: flex; align-items: flex-end; gap: 4px; flex: 1; min-width: 0; }
+  .tabs-wrap {
+    display: flex; align-items: flex-end; gap: 4px; flex: 1; min-width: 0;
+    overflow-x: auto; scrollbar-width: none;
+  }
+  .tabs-wrap::-webkit-scrollbar { display: none; }
   .tab {
-    display: flex; align-items: center; gap: 8px;
-    max-width: 220px; min-width: 110px;
-    padding: 7px 10px; border-radius: 8px 8px 0 0;
+    display: flex; align-items: center; gap: 7px;
+    max-width: 210px; min-width: 100px;
+    padding: 6px 9px; border-radius: 8px 8px 0 0;
     background: var(--surface); border: 1px solid transparent; border-bottom: none;
-    color: var(--muted); font-size: 12px; cursor: pointer;
-    transition: background .15s, color .15s;
-    user-select: none;
+    color: var(--muted); font-size: 12px; cursor: pointer; user-select: none;
+    flex-shrink: 0;
   }
   .tab:hover { background: var(--surface2); color: var(--text); }
   .tab.active {
     background: var(--surface2); color: var(--text);
-    border-color: var(--border);
-    box-shadow: inset 0 2px 0 var(--accent);
+    border-color: var(--border); box-shadow: inset 0 2px 0 var(--accent);
   }
-  .tab-title {
-    flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
+  .tab-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tab-close {
     width: 16px; height: 16px; border-radius: 4px; border: 0;
     background: transparent; color: var(--muted); font-size: 13px; line-height: 1;
     display: flex; align-items: center; justify-content: center; cursor: pointer;
   }
-  .tab-close:hover { background: rgba(239,68,68,.2); color: #fca5a5; }
+  .tab-close:hover { background: rgba(239,68,68,.25); color: #fca5a5; }
   .new-tab-btn {
-    width: 28px; height: 28px; margin-bottom: 4px; border-radius: 7px;
+    width: 26px; height: 26px; margin-bottom: 4px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--surface);
-    color: var(--text); font-size: 17px; cursor: pointer;
+    color: var(--text); font-size: 16px; cursor: pointer;
     display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
-  .new-tab-btn:hover { background: var(--surface3); border-color: var(--accent); color: var(--accent); }
-
-  /* Live Stream Badges on Right of Tab Strip */
-  .stream-pills {
-    display: flex; align-items: center; gap: 6px; padding-bottom: 5px; flex-shrink: 0;
-  }
+  .new-tab-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .stream-pills { display: flex; align-items: center; gap: 6px; padding-bottom: 4px; flex-shrink: 0; }
   .pill {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 11px; padding: 3px 8px; border-radius: 999px;
@@ -511,99 +509,106 @@ HTML = r"""<!doctype html>
 
   /* Toolbar */
   .toolbar {
-    display: flex; align-items: center; gap: 8px;
-    padding: 8px 12px; background: var(--surface2);
-    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 10px; background: var(--surface2);
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
   }
   .nav-btn {
-    height: 32px; min-width: 32px; padding: 0 9px;
-    border-radius: 7px; border: 1px solid var(--border);
+    height: 30px; min-width: 30px; padding: 0 8px;
+    border-radius: 6px; border: 1px solid var(--border);
     background: var(--surface); color: var(--text); font-size: 13px; cursor: pointer;
   }
-  .nav-btn:hover { background: var(--surface3); border-color: #3a4f69; }
+  .nav-btn:hover { background: var(--surface3); }
   .omnibox {
-    flex: 1; display: flex; align-items: center; gap: 8px;
-    background: #0a0e14; border: 1px solid var(--border);
-    border-radius: 8px; padding: 0 10px; height: 32px;
+    flex: 1; display: flex; align-items: center; gap: 6px;
+    background: #080c12; border: 1px solid var(--border);
+    border-radius: 7px; padding: 0 8px; height: 30px; min-width: 0;
   }
   .omnibox:focus-within { border-color: var(--accent); }
   .omnibox input {
     flex: 1; background: transparent; border: 0; outline: none;
-    color: var(--text); font-size: 13px;
+    color: var(--text); font-size: 12.5px; min-width: 0;
   }
   .go-btn {
-    height: 24px; padding: 0 10px; border-radius: 5px; border: 0;
-    background: var(--accent); color: #052014; font-weight: 700; font-size: 12px; cursor: pointer;
+    height: 22px; padding: 0 10px; border-radius: 5px; border: 0;
+    background: var(--accent); color: #052014; font-weight: 700; font-size: 11.5px; cursor: pointer;
   }
+  .ctrl-select {
+    height: 30px; padding: 0 7px; border-radius: 6px;
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); font-size: 11.5px; cursor: pointer;
+  }
+
+  /* Bookmarks */
   .bookmarks {
-    display: flex; align-items: center; gap: 6px; padding: 5px 12px;
+    display: flex; align-items: center; gap: 6px; padding: 4px 10px;
     background: var(--surface); border-bottom: 1px solid var(--border);
-    overflow-x: auto; scrollbar-width: none;
+    overflow-x: auto; scrollbar-width: none; flex-shrink: 0;
   }
   .bm {
-    font-size: 11px; padding: 3px 9px; border-radius: 6px;
+    font-size: 11px; padding: 2px 8px; border-radius: 5px;
     background: var(--surface2); border: 1px solid var(--border);
     color: var(--muted); cursor: pointer; white-space: nowrap;
   }
   .bm:hover { color: var(--text); border-color: var(--accent2); }
-  .ctrl-select {
-    height: 32px; padding: 0 8px; border-radius: 7px;
-    background: var(--surface); border: 1px solid var(--border);
-    color: var(--text); font-size: 12px; cursor: pointer;
-  }
 
-  /* Viewport */
+  /* Browser Viewport - strictly bounded so telemetry dock NEVER clips */
   .stage {
-    flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
-    background: radial-gradient(circle at center, #111924 0%, #06080c 100%);
-    padding: 8px; position: relative;
+    flex: 1 1 0; min-height: 0; width: 100%; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at center, #0e1621 0%, #05070a 100%);
+    padding: 6px; position: relative;
   }
-  .screen-frame {
-    height: 100%; max-width: 100%; aspect-ratio: 16 / 9;
-    background: #000; border: 1px solid var(--border); border-radius: 10px;
-    overflow: hidden; box-shadow: 0 12px 40px rgba(0,0,0,.6);
-    display: flex; align-items: center; justify-content: center; position: relative;
+  .img-wrap {
+    position: relative; max-width: 100%; max-height: 100%;
+    display: flex; align-items: center; justify-content: center;
   }
   #scr {
-    width: 100%; height: 100%; object-fit: contain; display: block;
+    max-width: 100%; max-height: calc(100vh - 205px);
+    width: auto; height: auto; aspect-ratio: 16 / 9;
+    object-fit: contain; display: block;
+    background: #000; border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.65);
     cursor: crosshair; user-select: none; outline: none;
   }
   .hud-overlay {
-    position: absolute; top: 10px; right: 10px;
-    background: rgba(9, 13, 19, 0.78); backdrop-filter: blur(6px);
-    border: 1px solid rgba(255,255,255,.1); border-radius: 7px;
-    padding: 4px 9px; font-family: ui-monospace, monospace; font-size: 11px;
+    position: absolute; top: 8px; right: 8px;
+    background: rgba(8, 11, 16, 0.8); backdrop-filter: blur(4px);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 6px;
+    padding: 3px 8px; font-family: ui-monospace, monospace; font-size: 11px;
     color: var(--accent); pointer-events: none;
   }
 
-  /* Bottom Telemetry Dock */
+  /* Bottom Telemetry Dock - fixed compact height, always visible */
   .telemetry {
-    background: #0a0e14; border-top: 1px solid var(--border);
-    padding: 8px 12px;
-    display: grid; grid-template-columns: repeat(6, minmax(150px, 1fr)); gap: 8px;
+    background: #070a0f; border-top: 1px solid var(--border);
+    padding: 7px 10px;
+    display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px;
     flex-shrink: 0;
   }
-  @media (max-width: 1100px) {
-    .telemetry { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 1050px) {
+    .telemetry { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #scr { max-height: calc(100vh - 280px); }
   }
   .card {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-    padding: 7px 10px; display: flex; flex-direction: column; gap: 4px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+    padding: 6px 9px; display: flex; flex-direction: column; gap: 3px; min-width: 0;
   }
   .card-top {
     display: flex; justify-content: space-between; align-items: center;
-    font-size: 10px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
   }
   .card-val {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 13px; font-weight: 700; color: var(--text);
+    font-size: 12.5px; font-weight: 700; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .card-sub {
     font-family: ui-monospace, monospace; font-size: 10px; color: var(--muted);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .bar { height: 4px; border-radius: 3px; background: #1a2432; overflow: hidden; }
-  .bar > i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .35s; }
+  .bar > i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .3s; }
   .bar.gpu > i { background: var(--accent2); }
   .bar.ram > i { background: #eab308; }
   .bar.bat > i { background: #22c55e; }
@@ -611,7 +616,6 @@ HTML = r"""<!doctype html>
 </head>
 <body>
 <div class="app">
-  <!-- Tab Bar -->
   <div class="tabbar">
     <div class="brand"><span class="brand-dot"></span>AGATE · MALI-G77</div>
     <div class="tabs-wrap" id="tabs"></div>
@@ -623,7 +627,6 @@ HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- Browser Navigation Bar -->
   <div class="toolbar">
     <button class="nav-btn" onclick="sendCtrl({type:'back'})" title="Geri">←</button>
     <button class="nav-btn" onclick="sendCtrl({type:'forward'})" title="İleri">→</button>
@@ -633,9 +636,9 @@ HTML = r"""<!doctype html>
       <button class="go-btn" onclick="nav()">Git</button>
     </div>
     <select class="ctrl-select" id="sel-nth" onchange="applyStreamCfg()" title="Kare Yakalama Sıklığı">
-      <option value="1">Akış: Her Kare (1x)</option>
+      <option value="1" selected>Akış: 1x (Akıcı)</option>
       <option value="2">Akış: 2x (Hızlı)</option>
-      <option value="3" selected>Akış: 3x (Dengeli)</option>
+      <option value="3">Akış: 3x (Dengeli)</option>
       <option value="5">Akış: 5x (Hafif)</option>
     </select>
     <select class="ctrl-select" id="sel-qual" onchange="applyStreamCfg()" title="JPEG Kalitesi">
@@ -647,9 +650,8 @@ HTML = r"""<!doctype html>
     <button class="nav-btn" onclick="toggleFs()" title="Tam Ekran">⛶</button>
   </div>
 
-  <!-- Quick Bookmarks -->
   <div class="bookmarks">
-    <span style="font-size:11px;color:var(--muted);margin-right:4px">Hızlı Testler:</span>
+    <span style="font-size:11px;color:var(--muted);margin-right:2px">Hızlı Testler:</span>
     <span class="bm" onclick="openUrl('https://webglsamples.org/aquarium/aquarium.html')">🐠 WebGL Aquarium</span>
     <span class="bm" onclick="openUrl('https://webglreport.com/?v=2')">📊 WebGL 2.0 Report</span>
     <span class="bm" onclick="openUrl('https://www.shadertoy.com/results?query=raymarching')">✨ Shadertoy Raymarch</span>
@@ -659,15 +661,13 @@ HTML = r"""<!doctype html>
     <span class="bm" onclick="openUrl('https://www.youtube.com/')">▶ YouTube</span>
   </div>
 
-  <!-- Browser Viewport -->
   <div class="stage" id="stage">
-    <div class="screen-frame">
-      <img id="scr" tabindex="0" alt="Chromium Live Stream">
+    <div class="img-wrap">
+      <img id="scr" src="/frame.jpg" tabindex="0" alt="Chromium Live Stream">
       <div class="hud-overlay" id="hud-overlay">1920×1080 · Bağlanıyor...</div>
     </div>
   </div>
 
-  <!-- Bottom Phone Telemetry Dock -->
   <div class="telemetry">
     <div class="card">
       <div class="card-top"><span>CPU (MT6893)</span><span id="t-gov">-</span></div>
@@ -715,15 +715,16 @@ let framesThisSec = 0;
 let bytesThisSec = 0;
 let lastBlobUrl = null;
 let lastMoveTs = 0;
+let wsConnected = false;
 
 urlInput.addEventListener('focus', () => currentUrlFocused = true);
 urlInput.addEventListener('blur', () => currentUrlFocused = false);
 
-// WebSocket Binary Stream + Real FPS Counter
 function connectStreamWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws/stream`);
   ws.binaryType = 'blob';
+  ws.onopen = () => { wsConnected = true; };
   ws.onmessage = (ev) => {
     framesThisSec++;
     bytesThisSec += ev.data.size;
@@ -732,7 +733,10 @@ function connectStreamWS() {
     if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
     lastBlobUrl = url;
   };
-  ws.onclose = () => setTimeout(connectStreamWS, 800);
+  ws.onclose = () => {
+    wsConnected = false;
+    setTimeout(connectStreamWS, 700);
+  };
 }
 connectStreamWS();
 
@@ -900,7 +904,6 @@ function toggleFs() {
   else document.exitFullscreen();
 }
 
-// Mouse & Keyboard Input Forwarding (1920x1080 mapped)
 function coords(e) {
   const r = scr.getBoundingClientRect();
   return {
@@ -1009,7 +1012,6 @@ async def api_tabs(request):
 async def api_tabs_new(request):
     body = await request.json() if request.can_read_body else {}
     u = body.get("url", "https://www.google.com/")
-    from urllib.parse import quote
     async with active_sess.put(f"http://127.0.0.1:{CDP_PORT}/json/new?{quote(u, safe=':/?&=')}") as r:
         data = await r.json()
     await attach_to_tab(data["id"])
