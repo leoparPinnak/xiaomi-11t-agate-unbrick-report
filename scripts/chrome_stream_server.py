@@ -77,6 +77,7 @@ async def cdp_loop():
             "--disable-vulkan",
             "--disable-features=Vulkan,Translate,OptimizationHints,MediaRouter,InterestCohort",
             "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization",
             "--enable-webgl",
             "--disable-blink-features=AutomationControlled",
             "--disable-background-timer-throttling",
@@ -124,7 +125,7 @@ async def cdp_loop():
                 "width": 1920, "height": 1080, "deviceScaleFactor": 1, "mobile": False
             })
             await cdp_call("Page.startScreencast", {
-                "format": "jpeg", "quality": 75, "maxWidth": 1280, "maxHeight": 720, "everyNthFrame": 1
+                "format": "jpeg", "quality": 65, "maxWidth": 1280, "maxHeight": 720, "everyNthFrame": 3
             })
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:

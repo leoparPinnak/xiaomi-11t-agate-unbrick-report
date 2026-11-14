@@ -110,9 +110,13 @@ def read_sys_info():
         gpu_pwr = "ON"
 
     gfreq = rfile("/proc/gpufreq/gpufreq_var_dump", "")
-    mf = re.search(r"\(real\)\s*freq:\s*(\d+)", gfreq)
+    mf = re.search(r"idx:\s*\d+,\s*freq:\s*(\d+)", gfreq)
     if mf:
         gpu_mhz = int(mf.group(1)) // 1000
+    mrf = re.search(r"\(real\)\s*freq:\s*(\d+)", gfreq)
+    if mrf and int(mrf.group(1)) > 0:
+        gpu_mhz = int(mrf.group(1)) // 1000
+        gpu_pwr = "ON"
     mp = re.search(r"g_power_count\s*=\s*(\d+)", gfreq)
     if mp and int(mp.group(1)) > 0:
         gpu_pwr = "ON"
@@ -122,7 +126,7 @@ def read_sys_info():
     if mm:
         gpu_mb = int(mm.group(1)) / (1024.0 * 1024.0)
     gpu_ctx = mmem.count("kctx-")
-    if gpu_pct > 0 or gpu_mhz > 0:
+    if gpu_pct > 0:
         gpu_pwr = "ON"
     gpu_desc = f"{gpu_mhz}MHz|{gpu_pwr}|{gpu_mb:.1f}MB|{gpu_ctx}ctx" if gpu_mhz > 0 else f"{gpu_pwr}|{gpu_mb:.1f}MB|{gpu_ctx}ctx"
 
