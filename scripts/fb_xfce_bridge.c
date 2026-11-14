@@ -14,13 +14,14 @@
 #include <linux/fb.h>
 #include <linux/input.h>
 
-#define SCR_W 1080
-#define SCR_H 2400
+#define FB_W 1080
+#define FB_H 2400
 #define FB_STRIDE_PX 1088
 #define XWD_PATH "/dev/shm/xfb/Xvfb_screen0"
 
 static volatile int g_running = 1;
 static volatile int g_screen_on = 1;
+static int g_landscape = 1; /* 1 = 2400x1080 (90 deg CCW: power/vol buttons on top), 0 = 1080x2400 */
 static pthread_mutex_t g_scr_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void write_sys(const char *path, const char *val) {
@@ -84,14 +85,35 @@ static void *fifo_thread(void *arg) {
     return NULL;
 }
 
+static void map_touch(int raw_x_px, int raw_y_px, int *out_x, int *out_y) {
+    if (g_landscape) {
+        /* 90 deg CCW: power button on top, USB-C on right */
+        int vx = (FB_H - 1) - raw_y_px;
+        int vy = raw_x_px;
+        if (vx < 0) vx = 0;
+        if (vx >= FB_H) vx = FB_H - 1;
+        if (vy < 0) vy = 0;
+        if (vy >= FB_W) vy = FB_W - 1;
+        *out_x = vx;
+        *out_y = vy;
+    } else {
+        int vx = raw_x_px;
+        int vy = raw_y_px;
+        if (vx < 0) vx = 0;
+        if (vx >= FB_W) vx = FB_W - 1;
+        if (vy < 0) vy = 0;
+        if (vy >= FB_H) vy = FB_H - 1;
+        *out_x = vx;
+        *out_y = vy;
+    }
+}
+
 static void *touch_thread(void *arg) {
     const char *disp_name = (const char *)arg;
     void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
     void *hxtst = dlopen("libXtst.so.6", RTLD_NOW);
-    if (!hx11 || !hxtst) {
-        fprintf(stderr, "fb_xfce_bridge: failed to dlopen libX11/libXtst\n");
-        return NULL;
-    }
+    if (!hx11 || !hxtst) return NULL;
+
     void *(*pXOpenDisplay)(const char *) = dlsym(hx11, "XOpenDisplay");
     int (*pXFlush)(void *) = dlsym(hx11, "XFlush");
     int (*pXTestFakeMotionEvent)(void *, int, int, int, unsigned long) = dlsym(hxtst, "XTestFakeMotionEvent");
@@ -114,7 +136,7 @@ static void *touch_thread(void *arg) {
     }
     if (fd < 0) return NULL;
 
-    int cur_x = 540, cur_y = 1200;
+    int raw_x = 540, raw_y = 1200;
     int touching = 0;
     int slot = 0;
     struct input_event ev;
@@ -125,14 +147,14 @@ static void *touch_thread(void *arg) {
 
         if (ev.type == EV_ABS) {
             if (ev.code == ABS_MT_SLOT) slot = ev.value;
-            else if (slot == 0 && ev.code == ABS_MT_POSITION_X) cur_x = ev.value / 10;
-            else if (slot == 0 && ev.code == ABS_MT_POSITION_Y) cur_y = ev.value / 10;
+            else if (slot == 0 && ev.code == ABS_MT_POSITION_X) raw_x = ev.value / 10;
+            else if (slot == 0 && ev.code == ABS_MT_POSITION_Y) raw_y = ev.value / 10;
             else if (slot == 0 && ev.code == ABS_MT_TRACKING_ID) {
+                int mx, my;
+                map_touch(raw_x, raw_y, &mx, &my);
                 if (ev.value >= 0 && !touching) {
                     touching = 1;
-                    if (cur_x < 0) cur_x = 0; if (cur_x >= SCR_W) cur_x = SCR_W - 1;
-                    if (cur_y < 0) cur_y = 0; if (cur_y >= SCR_H) cur_y = SCR_H - 1;
-                    pXTestFakeMotionEvent(dpy, -1, cur_x, cur_y, 0);
+                    pXTestFakeMotionEvent(dpy, -1, mx, my, 0);
                     pXTestFakeButtonEvent(dpy, 1, 1, 0);
                     pXFlush(dpy);
                 } else if (ev.value < 0 && touching) {
@@ -142,9 +164,11 @@ static void *touch_thread(void *arg) {
                 }
             }
         } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+            int mx, my;
+            map_touch(raw_x, raw_y, &mx, &my);
             if (ev.value == 1 && !touching) {
                 touching = 1;
-                pXTestFakeMotionEvent(dpy, -1, cur_x, cur_y, 0);
+                pXTestFakeMotionEvent(dpy, -1, mx, my, 0);
                 pXTestFakeButtonEvent(dpy, 1, 1, 0);
                 pXFlush(dpy);
             } else if (ev.value == 0 && touching) {
@@ -153,9 +177,9 @@ static void *touch_thread(void *arg) {
                 pXFlush(dpy);
             }
         } else if (ev.type == EV_SYN && ev.code == SYN_REPORT && touching) {
-            if (cur_x < 0) cur_x = 0; if (cur_x >= SCR_W) cur_x = SCR_W - 1;
-            if (cur_y < 0) cur_y = 0; if (cur_y >= SCR_H) cur_y = SCR_H - 1;
-            pXTestFakeMotionEvent(dpy, -1, cur_x, cur_y, 0);
+            int mx, my;
+            map_touch(raw_x, raw_y, &mx, &my);
+            pXTestFakeMotionEvent(dpy, -1, mx, my, 0);
             pXFlush(dpy);
         }
     }
@@ -171,6 +195,8 @@ static uint32_t read_be32(const uint8_t *p) {
 
 int main(int argc, char **argv) {
     const char *disp = argc > 1 ? argv[1] : ":0";
+    if (argc > 2 && strcmp(argv[2], "portrait") == 0) g_landscape = 0;
+
     signal(SIGTERM, on_sig);
     signal(SIGINT, on_sig);
 
@@ -188,16 +214,21 @@ int main(int argc, char **argv) {
     if (xmap == MAP_FAILED) { perror("mmap xwd"); return 2; }
 
     uint32_t hdr_sz = read_be32(xmap + 0);
+    uint32_t xv_w = read_be32(xmap + 16);
+    uint32_t xv_h = read_be32(xmap + 20);
     uint32_t ncolors = read_be32(xmap + 76);
+    if (xv_w == FB_W && xv_h == FB_H) g_landscape = 0;
+    else if (xv_w == FB_H && xv_h == FB_W) g_landscape = 1;
+
     size_t pix_off = hdr_sz + ncolors * 12;
     const uint32_t *src = (const uint32_t *)(xmap + pix_off);
 
     int fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd < 0) { perror("open /dev/fb0"); return 3; }
 
-    size_t fb_bytes = (size_t)FB_STRIDE_PX * SCR_H * 4;
+    size_t fb_bytes = (size_t)FB_STRIDE_PX * FB_H * 4;
     uint32_t *fb_map = mmap(NULL, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
-    uint32_t *prev = calloc(SCR_W * SCR_H, 4);
+    uint32_t *prev = calloc(FB_W * FB_H, 4);
 
     struct fb_var_screeninfo vinfo;
     ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
@@ -210,27 +241,42 @@ int main(int argc, char **argv) {
     pthread_create(&th_tch, NULL, touch_thread, (void *)disp);
 
     while (g_running) {
-        if (g_screen_on) {
-            int dirty = 0;
-            for (int y = 0; y < SCR_H; y++) {
-                const uint32_t *srow = src + y * SCR_W;
-                uint32_t *prow = prev + y * SCR_W;
-                if (memcmp(srow, prow, SCR_W * 4) != 0) {
-                    memcpy(prow, srow, SCR_W * 4);
-                    uint32_t *drow = (fb_map != MAP_FAILED) ? (fb_map + y * FB_STRIDE_PX) : NULL;
-                    if (drow) {
-                        for (int x = 0; x < SCR_W; x++) {
-                            uint32_t p = srow[x]; /* BGRX little-endian: B=low byte, R=byte2 */
+        if (g_screen_on && fb_map != MAP_FAILED) {
+            if (!g_landscape) {
+                int dirty = 0;
+                for (int y = 0; y < FB_H; y++) {
+                    const uint32_t *srow = src + y * FB_W;
+                    uint32_t *prow = prev + y * FB_W;
+                    if (memcmp(srow, prow, FB_W * 4) != 0) {
+                        memcpy(prow, srow, FB_W * 4);
+                        uint32_t *drow = fb_map + y * FB_STRIDE_PX;
+                        for (int x = 0; x < FB_W; x++) {
+                            uint32_t p = srow[x];
                             drow[x] = (p & 0x0000FF00U) | ((p & 0xFFU) << 16) | ((p >> 16) & 0xFFU) | 0xFF000000U;
                         }
+                        dirty = 1;
                     }
-                    dirty = 1;
                 }
-            }
-            if (dirty) {
-                vinfo.xoffset = 0;
-                vinfo.yoffset = 0;
-                ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
+                if (dirty) {
+                    vinfo.xoffset = 0; vinfo.yoffset = 0;
+                    ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
+                }
+            } else {
+                /* Landscape 2400x1080 -> physical 1080x2400 rotated 90 deg CCW */
+                if (memcmp(src, prev, (size_t)FB_W * FB_H * 4) != 0) {
+                    memcpy(prev, src, (size_t)FB_W * FB_H * 4);
+                    for (int y_fb = 0; y_fb < FB_H; y_fb++) {
+                        int vx = (FB_H - 1) - y_fb;
+                        uint32_t *drow = fb_map + y_fb * FB_STRIDE_PX;
+                        const uint32_t *scol = src + vx;
+                        for (int x_fb = 0; x_fb < FB_W; x_fb++) {
+                            uint32_t p = scol[x_fb * FB_H];
+                            drow[x_fb] = (p & 0x0000FF00U) | ((p & 0xFFU) << 16) | ((p >> 16) & 0xFFU) | 0xFF000000U;
+                        }
+                    }
+                    vinfo.xoffset = 0; vinfo.yoffset = 0;
+                    ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
+                }
             }
         }
         usleep(33000);
