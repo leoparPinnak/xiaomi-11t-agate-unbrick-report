@@ -369,7 +369,6 @@ HTML = r"""<!doctype html>
   }
   .pill.hw { color: #86efac; border-color: rgba(34,197,94,.45); }
   .pill.fps { color: #38bdf8; border-color: rgba(56,189,248,.4); }
-  .pill.drag { color: #fde047; border-color: rgba(250,204,21,.45); display: none; }
   .btn {
     height: 26px; padding: 0 9px; border-radius: 6px; border: 1px solid #2c3f57;
     background: #182334; color: #e6eef8; font-size: 11px; cursor: pointer;
@@ -405,7 +404,6 @@ HTML = r"""<!doctype html>
     <span class="pill hw">ENC: HW /dev/video4</span>
     <span class="pill fps" id="p-fps">FPS: --</span>
     <span class="pill" id="p-bw">-- KB/s</span>
-    <span class="pill drag" id="p-drag">SÜRÜKLENİYOR</span>
     <span class="pill" id="p-tel">CPU --% · RAM --MB · --°C · Bat --%</span>
     <div class="spacer"></div>
     <button class="btn" onclick="openChr()">🌐 Chromium Aç</button>
@@ -442,7 +440,6 @@ HTML = r"""<!doctype html>
 
 <script>
 const scr = document.getElementById('scr');
-const dragPill = document.getElementById('p-drag');
 let curW = 2400, curH = 1080, fps = 0, bytes = 0, lastBlob = null;
 let inWs = null;
 let dragging = false;
@@ -522,7 +519,6 @@ scr.addEventListener('pointerdown', e => {
   scr.focus();
   try { scr.setPointerCapture(e.pointerId); } catch (_) {}
   dragging = true;
-  dragPill.style.display = 'inline-block';
   const b = e.button === 2 ? 3 : (e.button === 1 ? 2 : 1);
   sendIn({type:'mouse', action:'down', button:b, ...coords(e)});
 });
@@ -538,7 +534,6 @@ scr.addEventListener('pointermove', e => {
 function endPointer(e) {
   if (!dragging) return;
   dragging = false;
-  dragPill.style.display = 'none';
   try { scr.releasePointerCapture(e.pointerId); } catch (_) {}
   const b = e.button === 2 ? 3 : (e.button === 1 ? 2 : 1);
   sendIn({type:'mouse', action:'up', button:b, ...coords(e)});
