@@ -10,6 +10,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -26,6 +28,8 @@
 #define XWD_PATH "/dev/shm/xfb/Xvfb_screen0"
 #define XFCE_SOCK "/tmp/xfce_hwjpeg.sock"
 #define XFCE_SHM_JPG "/dev/shm/xfce_hw.jpg"
+#define UDP_PORT 9900
+#define UDP_CHUNK_PAYLOAD 1360
 
 /* MediaTek Android ION ioctl (MTK 4.14) */
 struct mtk_ion_alloc_data { size_t len; size_t align; unsigned int heap_id_mask; unsigned int flags; int handle; };
@@ -45,6 +49,16 @@ typedef struct {
     unsigned long *pixels;
 } my_XFixesCursorImage;
 
+#pragma pack(push, 1)
+typedef struct {
+    char magic[4];      /* "AGTU" */
+    uint32_t frame_id;
+    uint32_t total_size;
+    uint16_t chunk_idx;
+    uint16_t chunk_cnt;
+} udp_chunk_hdr_t;
+#pragma pack(pop)
+
 static volatile int g_running = 1;
 static volatile int g_screen_on = 1;
 static int g_landscape = 1;
@@ -61,6 +75,14 @@ static pthread_mutex_t g_cli_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_srv_fd = -1;
 static int g_cli_fd = -1;
 static volatile int g_force_frame = 0;
+
+/* UDP state */
+static int g_udp_fd = -1;
+static pthread_mutex_t g_udp_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct sockaddr_in g_udp_cli;
+static int g_udp_has_cli = 0;
+static uint64_t g_udp_last_hello_ms = 0;
+static uint32_t g_udp_frame_id = 0;
 
 static inline uint64_t now_ms(void) {
     struct timespec ts;
@@ -226,6 +248,206 @@ static void *touch_thread(void *arg) {
     return NULL;
 }
 
+/* --- Direct C UDP Input Receiver (0-copy latency for mouse/drag/keyboard/Turkish) --- */
+typedef struct { uint32_t cp; uint32_t kc; int shift; } tr_slot_t;
+static const struct { uint32_t kc; unsigned long lo; unsigned long hi; } g_tr_map[6] = {
+    { 154, 0x01ba, 0x01aa }, /* ş Ş */
+    { 168, 0x02bb, 0x02ab }, /* ğ Ğ */
+    { 178, 0x00fc, 0x00dc }, /* ü Ü */
+    { 183, 0x02b9, 0x02a9 }, /* ı İ */
+    { 184, 0x00f6, 0x00d6 }, /* ö Ö */
+    { 197, 0x00e7, 0x00c7 }, /* ç Ç */
+};
+static const tr_slot_t g_tr_cp[12] = {
+    { 0x015f, 154, 0 }, { 0x015e, 154, 1 },
+    { 0x011f, 168, 0 }, { 0x011e, 168, 1 },
+    { 0x00fc, 178, 0 }, { 0x00dc, 178, 1 },
+    { 0x0131, 183, 0 }, { 0x0130, 183, 1 },
+    { 0x00f6, 184, 0 }, { 0x00d6, 184, 1 },
+    { 0x00e7, 197, 0 }, { 0x00c7, 197, 1 },
+};
+
+static const char *ascii_sym(char ch, int *need_shift) {
+    *need_shift = 0;
+    if (ch >= 'a' && ch <= 'z') return NULL;
+    if (ch >= 'A' && ch <= 'Z') { *need_shift = 1; return NULL; }
+    if (ch >= '0' && ch <= '9') return NULL;
+    switch (ch) {
+        case ' ': return "space"; case '\n': return "Return"; case '\t': return "Tab";
+        case '.': return "period"; case ',': return "comma"; case '/': return "slash";
+        case '?': *need_shift = 1; return "slash";
+        case ':': *need_shift = 1; return "semicolon";
+        case ';': return "semicolon";
+        case '-': return "minus"; case '_': *need_shift = 1; return "minus";
+        case '=': return "equal"; case '+': *need_shift = 1; return "equal";
+        case '!': *need_shift = 1; return "1"; case '@': *need_shift = 1; return "2";
+        case '#': *need_shift = 1; return "3"; case '$': *need_shift = 1; return "4";
+        case '%': *need_shift = 1; return "5"; case '^': *need_shift = 1; return "6";
+        case '&': *need_shift = 1; return "7"; case '*': *need_shift = 1; return "8";
+        case '(': *need_shift = 1; return "9"; case ')': *need_shift = 1; return "0";
+        case '[': return "bracketleft"; case ']': return "bracketright";
+        case '{': *need_shift = 1; return "bracketleft"; case '}': *need_shift = 1; return "bracketright";
+        case '\'': return "apostrophe"; case '"': *need_shift = 1; return "apostrophe";
+        case '\\': return "backslash"; case '|': *need_shift = 1; return "backslash";
+        case '<': *need_shift = 1; return "comma"; case '>': *need_shift = 1; return "period";
+        case '`': return "grave"; case '~': *need_shift = 1; return "grave";
+    }
+    return NULL;
+}
+
+static void *udp_rx_thread(void *arg) {
+    const char *disp_name = (const char *)arg;
+    void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
+    void *hxtst = dlopen("libXtst.so.6", RTLD_NOW);
+    if (!hx11 || !hxtst) return NULL;
+
+    void *(*pXOpenDisplay)(const char *) = dlsym(hx11, "XOpenDisplay");
+    int (*pXFlush)(void *) = dlsym(hx11, "XFlush");
+    int (*pXSync)(void *, int) = dlsym(hx11, "XSync");
+    unsigned int (*pXKeysymToKeycode)(void *, unsigned long) = dlsym(hx11, "XKeysymToKeycode");
+    unsigned long (*pXStringToKeysym)(const char *) = dlsym(hx11, "XStringToKeysym");
+    int (*pXChangeKeyboardMapping)(void *, int, int, unsigned long *, int) = dlsym(hx11, "XChangeKeyboardMapping");
+    int (*pXTestMotion)(void *, int, int, int, unsigned long) = dlsym(hxtst, "XTestFakeMotionEvent");
+    int (*pXTestBtn)(void *, unsigned int, int, unsigned long) = dlsym(hxtst, "XTestFakeButtonEvent");
+    int (*pXTestKey)(void *, unsigned int, int, unsigned long) = dlsym(hxtst, "XTestFakeKeyEvent");
+
+    void *dpy = NULL;
+    for (int i = 0; i < 50 && g_running; i++) {
+        dpy = pXOpenDisplay(disp_name);
+        if (dpy) break;
+        usleep(100000);
+    }
+    if (!dpy) return NULL;
+
+    for (int i = 0; i < 6; i++) {
+        unsigned long arr[2] = { g_tr_map[i].lo, g_tr_map[i].hi };
+        pXChangeKeyboardMapping(dpy, (int)g_tr_map[i].kc, 2, arr, 1);
+    }
+    pXSync(dpy, 0);
+
+    unsigned int kc_ctrl  = pXKeysymToKeycode(dpy, 0xFFE3);
+    unsigned int kc_alt   = pXKeysymToKeycode(dpy, 0xFFE9);
+    unsigned int kc_shift = pXKeysymToKeycode(dpy, 0xFFE1);
+    unsigned int kc_meta  = pXKeysymToKeycode(dpy, 0xFFEB);
+
+    uint8_t buf[2048];
+    struct sockaddr_in from;
+    while (g_running && g_udp_fd >= 0) {
+        socklen_t flen = sizeof(from);
+        ssize_t n = recvfrom(g_udp_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
+        if (n < 4) { usleep(5000); continue; }
+
+        if (memcmp(buf, "AGTH", 4) == 0) {
+            pthread_mutex_lock(&g_udp_mu);
+            g_udp_cli = from;
+            g_udp_has_cli = 1;
+            g_udp_last_hello_ms = now_ms();
+            g_force_frame = 1;
+            pthread_mutex_unlock(&g_udp_mu);
+
+            /* Reply AGTS + width(u16) + height(u16) + screen_on(u8) */
+            uint8_t ack[9];
+            memcpy(ack, "AGTS", 4);
+            ack[4] = (uint8_t)(g_xv_w & 0xff); ack[5] = (uint8_t)((g_xv_w >> 8) & 0xff);
+            ack[6] = (uint8_t)(g_xv_h & 0xff); ack[7] = (uint8_t)((g_xv_h >> 8) & 0xff);
+            ack[8] = (uint8_t)(g_screen_on ? 1 : 0);
+            sendto(g_udp_fd, ack, sizeof(ack), 0, (struct sockaddr *)&from, flen);
+            continue;
+        }
+
+        if (memcmp(buf, "AGTI", 4) != 0 || n < 5) continue;
+        uint8_t kind = buf[4];
+
+        if (kind == 1 && n >= 11) { /* MOUSE: action(1), button(1), x(i16), y(i16) */
+            uint8_t act = buf[5];
+            uint8_t btn = buf[6];
+            int16_t mx = (int16_t)(buf[7] | (buf[8] << 8));
+            int16_t my = (int16_t)(buf[9] | (buf[10] << 8));
+            if (mx < 0) mx = 0; if (mx >= g_xv_w) mx = (int16_t)(g_xv_w - 1);
+            if (my < 0) my = 0; if (my >= g_xv_h) my = (int16_t)(g_xv_h - 1);
+            pXTestMotion(dpy, -1, mx, my, 0);
+            if (act == 1) pXTestBtn(dpy, btn, 1, 0);
+            else if (act == 2) pXTestBtn(dpy, btn, 0, 0);
+            else if (act == 3) { pXTestBtn(dpy, btn, 1, 0); pXTestBtn(dpy, btn, 0, 0); }
+            pXFlush(dpy);
+        } else if (kind == 2 && n >= 10) { /* KEY: mods(1), keysym(u32) */
+            uint8_t mods = buf[5];
+            uint32_t ks = (uint32_t)buf[6] | ((uint32_t)buf[7] << 8) | ((uint32_t)buf[8] << 16) | ((uint32_t)buf[9] << 24);
+            unsigned int kc = pXKeysymToKeycode(dpy, (unsigned long)ks);
+            if (kc) {
+                if ((mods & 1) && kc_ctrl)  pXTestKey(dpy, kc_ctrl, 1, 0);
+                if ((mods & 2) && kc_alt)   pXTestKey(dpy, kc_alt, 1, 0);
+                if ((mods & 4) && kc_shift) pXTestKey(dpy, kc_shift, 1, 0);
+                if ((mods & 8) && kc_meta)  pXTestKey(dpy, kc_meta, 1, 0);
+                pXTestKey(dpy, kc, 1, 0);
+                pXTestKey(dpy, kc, 0, 0);
+                if ((mods & 8) && kc_meta)  pXTestKey(dpy, kc_meta, 0, 0);
+                if ((mods & 4) && kc_shift) pXTestKey(dpy, kc_shift, 0, 0);
+                if ((mods & 2) && kc_alt)   pXTestKey(dpy, kc_alt, 0, 0);
+                if ((mods & 1) && kc_ctrl)  pXTestKey(dpy, kc_ctrl, 0, 0);
+                pXFlush(dpy);
+            }
+        } else if (kind == 3 && n >= 7) { /* UTF-8 TEXT: len(u16) + bytes */
+            uint16_t tlen = (uint16_t)(buf[5] | (buf[6] << 8));
+            if (7 + tlen > n) tlen = (uint16_t)(n - 7);
+            size_t i = 0;
+            const uint8_t *tp = buf + 7;
+            while (i < tlen) {
+                uint32_t cp = 0;
+                if (tp[i] < 0x80) { cp = tp[i++]; }
+                else if ((tp[i] & 0xE0) == 0xC0 && i + 1 < tlen) {
+                    cp = ((tp[i] & 0x1F) << 6) | (tp[i + 1] & 0x3F); i += 2;
+                } else if ((tp[i] & 0xF0) == 0xE0 && i + 2 < tlen) {
+                    cp = ((tp[i] & 0x0F) << 12) | ((tp[i + 1] & 0x3F) << 6) | (tp[i + 2] & 0x3F); i += 3;
+                } else { i++; continue; }
+
+                unsigned int kc = 0; int sh = 0;
+                for (int k = 0; k < 12; k++) {
+                    if (g_tr_cp[k].cp == cp) { kc = g_tr_cp[k].kc; sh = g_tr_cp[k].shift; break; }
+                }
+                if (!kc && cp < 128) {
+                    char ch = (char)cp;
+                    const char *sname = ascii_sym(ch, &sh);
+                    if (sname) {
+                        kc = pXKeysymToKeycode(dpy, pXStringToKeysym(sname));
+                    } else {
+                        char tmp[2] = { (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch, 0 };
+                        kc = pXKeysymToKeycode(dpy, pXStringToKeysym(tmp));
+                    }
+                }
+                if (kc) {
+                    if (sh && kc_shift) pXTestKey(dpy, kc_shift, 1, 0);
+                    pXTestKey(dpy, kc, 1, 0);
+                    pXTestKey(dpy, kc, 0, 0);
+                    if (sh && kc_shift) pXTestKey(dpy, kc_shift, 0, 0);
+                }
+            }
+            pXFlush(dpy);
+        } else if (kind == 4 && n >= 6) { /* CMD */
+            uint8_t cmd = buf[5];
+            if (cmd == 4) {
+                set_screen(!g_screen_on);
+            } else if (cmd == 1) {
+                char sc[512];
+                snprintf(sc, sizeof(sc),
+                    "su - ubuntu -c \"DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage "
+                    "--new-window --window-size=%d,%d --window-position=0,28 --user-data-dir=/home/ubuntu/.config/chr_xfce "
+                    "https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &\" &", g_xv_w, g_xv_h > 80 ? g_xv_h - 80 : 600);
+                int r = system(sc); (void)r;
+            } else if (cmd == 2) {
+                int r = system("su - ubuntu -c \"DISPLAY=:0 nohup xfce4-terminal --geometry=120x32+80+60 >/tmp/term_xfce.log 2>&1 &\" &"); (void)r;
+            } else if (cmd == 3) {
+                int r = system("su - ubuntu -c \"DISPLAY=:0 nohup thunar /home/ubuntu >/tmp/thunar_xfce.log 2>&1 &\" &"); (void)r;
+            } else if (cmd == 5) {
+                int r = system("/usr/local/bin/ekran xfce yatay &"); (void)r;
+            } else if (cmd == 6) {
+                int r = system("/usr/local/bin/ekran xfce dikey &"); (void)r;
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Blend XFixes ARGB cursor onto BGRX frame buffer */
 static void overlay_cursor(uint32_t *buf, int w, int h, const my_XFixesCursorImage *ci) {
     if (!ci || !ci->pixels || ci->width == 0 || ci->height == 0) return;
@@ -304,8 +526,7 @@ static void bgrx_to_yuyv_neon(const uint8_t *src, uint8_t *dst, int w, int h) {
             uint8_t tmp[32];
             vst4_u8(tmp, out);
             memcpy(d, tmp, 16);
-            s += 32;
-            d += 16;
+            s += 32; d += 16;
         }
         for (; x < w; x += 2) {
             int b0 = s[0], g0 = s[1], r0 = s[2];
@@ -435,6 +656,7 @@ static void send_frame(const uint8_t *jpg, uint32_t len) {
         close(fd_shm);
         rename(XFCE_SHM_JPG ".tmp", XFCE_SHM_JPG);
     }
+
     pthread_mutex_lock(&g_cli_mu);
     if (g_cli_fd >= 0) {
         uint8_t hdr[4] = { len & 0xff, (len >> 8) & 0xff, (len >> 16) & 0xff, (len >> 24) & 0xff };
@@ -445,6 +667,32 @@ static void send_frame(const uint8_t *jpg, uint32_t len) {
         }
     }
     pthread_mutex_unlock(&g_cli_mu);
+
+    /* Direct zero-broker UDP chunked frame blast */
+    pthread_mutex_lock(&g_udp_mu);
+    int has_u = (g_udp_has_cli && g_udp_fd >= 0 && (now_ms() - g_udp_last_hello_ms <= 10000));
+    struct sockaddr_in ucli = g_udp_cli;
+    if (!has_u) g_udp_has_cli = 0;
+    pthread_mutex_unlock(&g_udp_mu);
+
+    if (has_u) {
+        uint32_t fid = ++g_udp_frame_id;
+        uint16_t cnt = (uint16_t)((len + UDP_CHUNK_PAYLOAD - 1) / UDP_CHUNK_PAYLOAD);
+        uint8_t pkt[sizeof(udp_chunk_hdr_t) + UDP_CHUNK_PAYLOAD];
+        for (uint16_t idx = 0; idx < cnt; idx++) {
+            uint32_t off = (uint32_t)idx * UDP_CHUNK_PAYLOAD;
+            uint32_t plen = len - off;
+            if (plen > UDP_CHUNK_PAYLOAD) plen = UDP_CHUNK_PAYLOAD;
+            udp_chunk_hdr_t *h = (udp_chunk_hdr_t *)pkt;
+            memcpy(h->magic, "AGTU", 4);
+            h->frame_id = fid;
+            h->total_size = len;
+            h->chunk_idx = idx;
+            h->chunk_cnt = cnt;
+            memcpy(pkt + sizeof(*h), jpg + off, plen);
+            sendto(g_udp_fd, pkt, sizeof(*h) + plen, 0, (struct sockaddr *)&ucli, sizeof(ucli));
+        }
+    }
 }
 
 static void *enc_thread(void *arg) {
@@ -516,6 +764,23 @@ int main(int argc, char **argv) {
     struct fb_var_screeninfo vinfo;
     ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
 
+    /* Open UDP port 9900 with large kernel buffers */
+    g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udp_fd >= 0) {
+        int sb = 4 * 1024 * 1024, rb = 1 * 1024 * 1024;
+        setsockopt(g_udp_fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
+        setsockopt(g_udp_fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
+        struct sockaddr_in bind_addr = {0};
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = INADDR_ANY;
+        bind_addr.sin_port = htons(UDP_PORT);
+        if (bind(g_udp_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            perror("bind udp 9900");
+            close(g_udp_fd);
+            g_udp_fd = -1;
+        }
+    }
+
     /* Load X11 + XFixes to read real cursor shape & position */
     void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
     void *hxfix = dlopen("libXfixes.so.3", RTLD_NOW);
@@ -526,12 +791,13 @@ int main(int argc, char **argv) {
 
     set_screen(1);
 
-    pthread_t th_pwr, th_fifo, th_tch, th_acc, th_enc;
+    pthread_t th_pwr, th_fifo, th_tch, th_acc, th_enc, th_urx;
     pthread_create(&th_pwr, NULL, power_thread, NULL);
     pthread_create(&th_fifo, NULL, fifo_thread, NULL);
     pthread_create(&th_tch, NULL, touch_thread, (void *)disp);
     pthread_create(&th_acc, NULL, accept_thread, NULL);
     pthread_create(&th_enc, NULL, enc_thread, NULL);
+    if (g_udp_fd >= 0) pthread_create(&th_urx, NULL, udp_rx_thread, (void *)disp);
 
     uint64_t last_enc_ms = 0;
     int prev_cx = -999, prev_cy = -999;
@@ -539,7 +805,7 @@ int main(int argc, char **argv) {
 
     while (g_running) {
         uint64_t t = now_ms();
-        int has_cli = (g_cli_fd >= 0);
+        int has_cli = (g_cli_fd >= 0 || (g_udp_has_cli && t - g_udp_last_hello_ms <= 10000));
         int fb_changed = (memcmp(src, prev_raw, (size_t)FB_W * FB_H * 4) != 0);
         my_XFixesCursorImage *ci = (cur_dpy && pGetCursor) ? pGetCursor(cur_dpy) : NULL;
         int cur_changed = (ci && (ci->x != prev_cx || ci->y != prev_cy || ci->cursor_serial != prev_serial));
@@ -588,10 +854,11 @@ int main(int argc, char **argv) {
             }
         }
         if (ci && pXFree) pXFree(ci);
-        usleep(18000);
+        usleep(16000);
     }
 
     set_screen(0);
+    if (g_udp_fd >= 0) close(g_udp_fd);
     if (g_srv_fd >= 0) close(g_srv_fd);
     unlink(XFCE_SOCK);
     free(prev_raw);

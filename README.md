@@ -291,6 +291,15 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - `:8090` ve `:8080` üzerine `draggable="false"` + `pointerdown/pointermove/pointerup` + `setPointerCapture` ile gerçek tutup sürükleme; `:8090` içine `/ws/input` WebSocket kanalı, `Ctrl+A/C/V/X/Z/T/W` / `Alt+Tab` kısayol barı ve çakışmasız boş keycode slotları (`154..197`) ile tam Türkçe karakter (`ç ğ ı İ ö ş ü`) desteği eklendi.
    - Python 3.10 Garbage Collector'ın referanssız `asyncio.create_task` soket okuyucularını iptal ederek `FPS: 0` üretmesi (`Task was destroyed but it is pending`) her iki sunucuda `_spawn()` referans setiyle kalıcı çözüldü.
 
+### Adım 19: Sıfır-Aracı Saf UDP Görüntü & Girdi Sunucusu (`:9900`) ve PySide6 UDP Masaüstü İstemcisi
+1. **Doğrudan C Çekirdeğinden UDP Yayın (`scripts/fb_xfce_bridge.c`):**
+   - `fb_xfce_bridge` üzerine `4 MB` send buffer'lı **UDP `:9900`** dinleyici ve yayıncı eklendi.
+   - `AGTH` (Hello/keepalive) gönderen istemciye `AGTS` (`width×height`, ekran durumu) yanıtı döner; `/dev/video4`'ten çıkan her JPEG kareyi `1360 byte` parçalara bölerek (`AGTU` başlığı + `frame_id`, `chunk_idx`, `chunk_cnt`) doğrudan UDP ile yollar.
+   - `AGTI` ikili girdi protokolü ile fare hareket/tıklama/sürükleme/tekerlek, kısayol tuşları (`Ctrl/Alt/Shift`), Türkçe UTF-8 metin ve uygulama/döndürme komutlarını doğrudan C üzerinden X11'e (`XTest`) basar.
+2. **Sıfırdan Qt6 (PySide6) UDP İstemcisi (`scripts/agate_udp_client.py`):**
+   - Eski yarım kalan kareleri atarak head-of-line takılmasını önler; `QImage.fromData(..., "JPEG")` (`libjpeg-turbo`) ile doğrudan GPU/Qt penceresine çizer.
+   - Canlı test sonucu: **19.7 FPS (`2400×1080`, ~2.7 MB/s)**, PySide6 GUI üzerinde **%0.0 paket kaybı** ile doğrulandı (`C:\mtk\agate_udp_client.py` ve `C:\mtk\baslat_udp_ekran.bat`).
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -314,6 +323,7 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `ekran xfce | terminal` mod anahtarı |
 | `scripts/fb_xfce_bridge.c` & `scripts/start_xfce_fb.sh` | `Xvfb :0` → `/dev/fb0` + `fts` dokunmatik + `/dev/video4` HW-JPEG akış köprüsü |
 | `scripts/xfce_stream_server.py` | `:8090` canlı XFCE masaüstü web konsolu (`/dev/video4` + XTest uzaktan kontrol) |
+| `scripts/agate_udp_client.py` | Sıfırdan yazılmış Qt6 (`PySide6`) saf UDP `:9900` donanım JPEG masaüstü istemcisi |
 | `scripts/libhybris_mali_agate.patch` | `libhybris` Mali-G77 MC9 (`Android 11` / `MT6893` `/dev/ion` & ANGLE) tam yaması |
 | `scripts/weston_hwjpeg.c` | Weston C modülü: ARM64 NEON + ION `0x400` + `/dev/video3` donanım JPEG akış eklentisi |
 | `scripts/hwjpeg_v4l2.c` | `/dev/video3` & `/dev/video4` ION `0x400` V4L2 DMABUF donanım JPEG kütüphanesi (`/usr/local/lib/libhwjpeg.so`) |
