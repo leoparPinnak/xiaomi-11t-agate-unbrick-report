@@ -693,6 +693,7 @@ HTML = r"""<!doctype html>
     </select>
     <button class="nav-btn" onclick="pasteClip()" title="Panoyu Yapıştır">📋</button>
     <button class="nav-btn" onclick="toggleFs()" title="Tam Ekran">⛶</button>
+    <button class="nav-btn" onclick="location.href=location.protocol+'//'+location.hostname+':8090/'" title="Telefon XFCE Masaüstüne Geç" style="border-color:rgba(0,229,153,.4);color:#00e599">🖥️ XFCE</button>
   </div>
 
   <div class="bookmarks">

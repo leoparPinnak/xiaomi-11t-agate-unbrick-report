@@ -279,6 +279,14 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - `sudo ekran terminal`: Eski hafif telemetri + `tmux` terminal dashboard'una (`fbui.py`) geri döner.
    - `sudo ekran ac | kapat | toggle`: Güç tuşuyla aynı şekilde ekranı açar/kapatır.
 
+### Adım 18: XFCE4 Masaüstünün `/dev/video4` Donanım JPEG ile Canlı Tarayıcıya Basılması (`:8090`)
+1. **DRM & Zero-Copy Donanım Keşfi (`/dev/dri/card0`):**
+   - `libdrm` probu ile `CRTC[0]` (`fb=99`, `1088×7200`, `pitch=4352`) ve `drmPrimeHandleToFD` üzerinden DMA-BUF `fd` alındığı doğrulandı; ancak MediaTek `4.14` çekirdeğinde boot framebuffer GEM `mmap` (`ENODEV`), Mali `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` import (`(nil)`) ve `DRM_CLIENT_CAP_WRITEBACK_CONNECTORS` (`-1`) desteklenmediği için doğrudan `Xvfb_screen0` (`2400×1080`) + ikinci donanım motoru `/dev/video4` seçildi.
+2. **Çift Donanım Motorlu Eşzamanlı Yayın (`scripts/fb_xfce_bridge.c` + `scripts/xfce_stream_server.py`):**
+   - `fb_xfce_bridge` içine **ARM64 NEON SIMD (`bgrx_to_yuyv_neon`)** + **ION `0x400` DMA-BUF** + **`/dev/video4` (`mtk-jpeg-enc`)** encoder thread eklendi; `/tmp/xfce_hwjpeg.sock` üzerinden ham JPEG karelerini yayınlar.
+   - `http://192.168.2.212:8090/` arayüzü (`xfce_stream_server.py`) tarayıcıdan **tıklama, sağ tık, sürükleme, kaydırma, klavye, yatay/dikey döndürme ve ekran ışığı aç/kapat** kontrolü sağlar (`libX11` + `libXtst`).
+   - `:8080` (`/dev/video3` Mali GPU WebGL/Chromium konsolu) ile `:8090` (`/dev/video4` XFCE masaüstü yayını) arasında üst çubuktaki butonlarla tek tıkla geçiş yapılabilir.
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -300,7 +308,8 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/build_native_boot.py` | Stok `kernel` + `dtb` + statik `busybox` `initramfs` ile Android'siz `boot.img` üreticisi |
 | `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı + `%67–%70` şarj kesici |
 | `scripts/fbui.py`, `scripts/ekran.sh` | `/dev/fb0` canlı telemetri dashboard + `ekran xfce | terminal` mod anahtarı |
-| `scripts/fb_xfce_bridge.c` & `scripts/start_xfce_fb.sh` | `Xvfb :0` → `/dev/fb0` + `fts` dokunmatik (`/dev/input/event4`) + Güç tuşu XFCE köprüsü |
+| `scripts/fb_xfce_bridge.c` & `scripts/start_xfce_fb.sh` | `Xvfb :0` → `/dev/fb0` + `fts` dokunmatik + `/dev/video4` HW-JPEG akış köprüsü |
+| `scripts/xfce_stream_server.py` | `:8090` canlı XFCE masaüstü web konsolu (`/dev/video4` + XTest uzaktan kontrol) |
 | `scripts/libhybris_mali_agate.patch` | `libhybris` Mali-G77 MC9 (`Android 11` / `MT6893` `/dev/ion` & ANGLE) tam yaması |
 | `scripts/weston_hwjpeg.c` | Weston C modülü: ARM64 NEON + ION `0x400` + `/dev/video3` donanım JPEG akış eklentisi |
 | `scripts/hwjpeg_v4l2.c` | `/dev/video3` & `/dev/video4` ION `0x400` V4L2 DMABUF donanım JPEG kütüphanesi (`/usr/local/lib/libhwjpeg.so`) |

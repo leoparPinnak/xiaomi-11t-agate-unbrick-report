@@ -26,3 +26,6 @@ sleep 0.6
 su - ubuntu -c "DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS= nohup dbus-launch --exit-with-session startxfce4 >/tmp/xfce.log 2>&1 &"
 sleep 3
 su - ubuntu -c "DISPLAY=:0 nohup /usr/bin/chromium --no-sandbox --test-type --disable-dev-shm-usage --window-size=${CW},${CH} --window-position=0,35 --user-data-dir=/home/ubuntu/.config/chr_xfce https://www.google.com/ >/tmp/chr_xfce.log 2>&1 &"
+
+pkill -f "/opt/chrome_stream/xfce_server.py" 2>/dev/null || true
+nohup /usr/bin/python3 /opt/chrome_stream/xfce_server.py >/var/log/xfce_stream.log 2>&1 </dev/null &

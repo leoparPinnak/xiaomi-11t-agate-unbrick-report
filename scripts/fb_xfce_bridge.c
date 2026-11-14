@@ -3,26 +3,60 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <linux/videodev2.h>
+#include <arm_neon.h>
 
 #define FB_W 1080
 #define FB_H 2400
 #define FB_STRIDE_PX 1088
 #define XWD_PATH "/dev/shm/xfb/Xvfb_screen0"
+#define XFCE_SOCK "/tmp/xfce_hwjpeg.sock"
+#define XFCE_SHM_JPG "/dev/shm/xfce_hw.jpg"
+
+/* MediaTek Android ION ioctl (MTK 4.14) */
+struct mtk_ion_alloc_data { size_t len; size_t align; unsigned int heap_id_mask; unsigned int flags; int handle; };
+struct mtk_ion_fd_data    { int handle; int fd; };
+struct mtk_ion_handle_data{ int handle; };
+#define ION_IOC_ALLOC _IOWR('I', 0, struct mtk_ion_alloc_data)
+#define ION_IOC_FREE  _IOWR('I', 1, struct mtk_ion_handle_data)
+#define ION_IOC_SHARE _IOWR('I', 4, struct mtk_ion_fd_data)
+#define ION_HEAP_MULTIMEDIA_MASK (1u << 10)
 
 static volatile int g_running = 1;
 static volatile int g_screen_on = 1;
-static int g_landscape = 1; /* 1 = 2400x1080 (90 deg CCW: power/vol buttons on top), 0 = 1080x2400 */
+static int g_landscape = 1;
+static int g_xv_w = 2400;
+static int g_xv_h = 1080;
+
 static pthread_mutex_t g_scr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_enc_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_enc_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t *g_enc_buf = NULL;
+static int g_enc_ready = 0;
+
+static pthread_mutex_t g_cli_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_srv_fd = -1;
+static int g_cli_fd = -1;
+
+static inline uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
 
 static void write_sys(const char *path, const char *val) {
     int fd = open(path, O_WRONLY);
@@ -54,9 +88,8 @@ static void *power_thread(void *arg) {
     while (g_running) {
         ssize_t n = read(fd, &ev, sizeof(ev));
         if (n == (ssize_t)sizeof(ev)) {
-            if (ev.type == EV_KEY && ev.code == KEY_POWER && ev.value == 1) {
+            if (ev.type == EV_KEY && ev.code == KEY_POWER && ev.value == 1)
                 set_screen(!g_screen_on);
-            }
         } else if (n <= 0) {
             usleep(100000);
         }
@@ -87,24 +120,16 @@ static void *fifo_thread(void *arg) {
 
 static void map_touch(int raw_x_px, int raw_y_px, int *out_x, int *out_y) {
     if (g_landscape) {
-        /* 90 deg CCW: power button on top, USB-C on right */
         int vx = (FB_H - 1) - raw_y_px;
         int vy = raw_x_px;
-        if (vx < 0) vx = 0;
-        if (vx >= FB_H) vx = FB_H - 1;
-        if (vy < 0) vy = 0;
-        if (vy >= FB_W) vy = FB_W - 1;
-        *out_x = vx;
-        *out_y = vy;
+        if (vx < 0) vx = 0; if (vx >= FB_H) vx = FB_H - 1;
+        if (vy < 0) vy = 0; if (vy >= FB_W) vy = FB_W - 1;
+        *out_x = vx; *out_y = vy;
     } else {
-        int vx = raw_x_px;
-        int vy = raw_y_px;
-        if (vx < 0) vx = 0;
-        if (vx >= FB_W) vx = FB_W - 1;
-        if (vy < 0) vy = 0;
-        if (vy >= FB_H) vy = FB_H - 1;
-        *out_x = vx;
-        *out_y = vy;
+        int vx = raw_x_px, vy = raw_y_px;
+        if (vx < 0) vx = 0; if (vx >= FB_W) vx = FB_W - 1;
+        if (vy < 0) vy = 0; if (vy >= FB_H) vy = FB_H - 1;
+        *out_x = vx; *out_y = vy;
     }
 }
 
@@ -136,9 +161,7 @@ static void *touch_thread(void *arg) {
     }
     if (fd < 0) return NULL;
 
-    int raw_x = 540, raw_y = 1200;
-    int touching = 0;
-    int slot = 0;
+    int raw_x = 540, raw_y = 1200, touching = 0, slot = 0;
     struct input_event ev;
     while (g_running) {
         ssize_t n = read(fd, &ev, sizeof(ev));
@@ -187,7 +210,220 @@ static void *touch_thread(void *arg) {
     return NULL;
 }
 
-static void on_sig(int s) { (void)s; g_running = 0; }
+/* NEON BGRX -> YUYV conversion (XWD 32-bit little endian = B,G,R,X) */
+static void bgrx_to_yuyv_neon(const uint8_t *src, uint8_t *dst, int w, int h) {
+    const uint8x8_t k66  = vdup_n_u8(66);
+    const uint8x8_t k129 = vdup_n_u8(129);
+    const uint8x8_t k25  = vdup_n_u8(25);
+    const int16x8_t km38 = vdupq_n_s16(-38);
+    const int16x8_t km74 = vdupq_n_s16(-74);
+    const int16x8_t k112 = vdupq_n_s16(112);
+    const int16x8_t km94 = vdupq_n_s16(-94);
+    const int16x8_t km18 = vdupq_n_s16(-18);
+
+    for (int y = 0; y < h; y++) {
+        const uint8_t *s = src + (size_t)y * w * 4;
+        uint8_t *d = dst + (size_t)y * w * 2;
+        int x = 0;
+        for (; x + 8 <= w; x += 8) {
+            uint8x8x4_t bgrx = vld4_u8(s);
+            uint16x8_t y16 = vmull_u8(bgrx.val[2], k66);
+            y16 = vmlal_u8(y16, bgrx.val[1], k129);
+            y16 = vmlal_u8(y16, bgrx.val[0], k25);
+            y16 = vaddq_u16(y16, vdupq_n_u16(128));
+            uint8x8_t Y = vadd_u8(vqshrn_n_u16(y16, 8), vdup_n_u8(16));
+
+            int16x8_t r16 = vreinterpretq_s16_u16(vmovl_u8(bgrx.val[2]));
+            int16x8_t g16 = vreinterpretq_s16_u16(vmovl_u8(bgrx.val[1]));
+            int16x8_t b16 = vreinterpretq_s16_u16(vmovl_u8(bgrx.val[0]));
+
+            int16x8_t u16 = vaddq_s16(vmulq_s16(r16, km38), vmulq_s16(g16, km74));
+            u16 = vaddq_s16(u16, vmulq_s16(b16, k112));
+            u16 = vaddq_s16(u16, vdupq_n_s16(128));
+            uint8x8_t U = vqmovun_s16(vaddq_s16(vshrq_n_s16(u16, 8), vdupq_n_s16(128)));
+
+            int16x8_t v16 = vaddq_s16(vmulq_s16(r16, k112), vmulq_s16(g16, km94));
+            v16 = vaddq_s16(v16, vmulq_s16(b16, km18));
+            v16 = vaddq_s16(v16, vdupq_n_s16(128));
+            uint8x8_t V = vqmovun_s16(vaddq_s16(vshrq_n_s16(v16, 8), vdupq_n_s16(128)));
+
+            uint8x8x2_t y_pairs = vtrn_u8(Y, Y);
+            uint8x8_t y_even = y_pairs.val[0];
+            uint8x8_t y_odd  = y_pairs.val[1];
+            uint8x8x4_t out;
+            out.val[0] = vuzp1_u8(y_even, y_even);
+            out.val[1] = vuzp1_u8(U, U);
+            out.val[2] = vuzp1_u8(y_odd, y_odd);
+            out.val[3] = vuzp1_u8(V, V);
+            uint8_t tmp[32];
+            vst4_u8(tmp, out);
+            memcpy(d, tmp, 16);
+            s += 32;
+            d += 16;
+        }
+        for (; x < w; x += 2) {
+            int b0 = s[0], g0 = s[1], r0 = s[2];
+            int b1 = s[4], g1 = s[5], r1 = s[6];
+            int y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16;
+            int y1 = ((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16;
+            int u  = ((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8) + 128;
+            int v  = ((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8) + 128;
+            d[0] = (uint8_t)(y0 < 0 ? 0 : (y0 > 255 ? 255 : y0));
+            d[1] = (uint8_t)(u < 0 ? 0 : (u > 255 ? 255 : u));
+            d[2] = (uint8_t)(y1 < 0 ? 0 : (y1 > 255 ? 255 : y1));
+            d[3] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+            s += 8; d += 4;
+        }
+    }
+}
+
+typedef struct {
+    int ion_fd, vfd;
+    int in_h, in_fd, cap_h, cap_fd;
+    uint8_t *in_map, *cap_map;
+    size_t in_size, cap_size;
+} hwjpeg_ctx;
+
+static int ion_alloc_buf(int ion_fd, size_t sz, int *out_h, int *out_fd, uint8_t **out_map) {
+    struct mtk_ion_alloc_data ad = { .len = sz, .align = 4096, .heap_id_mask = ION_HEAP_MULTIMEDIA_MASK, .flags = 0 };
+    if (ioctl(ion_fd, ION_IOC_ALLOC, &ad) < 0) return -1;
+    struct mtk_ion_fd_data fd_d = { .handle = ad.handle, .fd = -1 };
+    if (ioctl(ion_fd, ION_IOC_SHARE, &fd_d) < 0) return -1;
+    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd_d.fd, 0);
+    if (m == MAP_FAILED) return -1;
+    *out_h = ad.handle; *out_fd = fd_d.fd; *out_map = (uint8_t *)m;
+    return 0;
+}
+
+static int hwjpeg_init(hwjpeg_ctx *c, int w, int h) {
+    memset(c, 0, sizeof(*c));
+    c->ion_fd = open("/dev/ion", O_RDWR);
+    c->vfd = open("/dev/video4", O_RDWR);
+    if (c->ion_fd < 0 || c->vfd < 0) return -1;
+
+    struct v4l2_control ctrl = { .id = V4L2_CID_JPEG_COMPRESSION_QUALITY, .value = 88 };
+    ioctl(c->vfd, VIDIOC_S_CTRL, &ctrl);
+
+    struct v4l2_format f_out = {0};
+    f_out.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+    f_out.fmt.pix_mp.width = w;
+    f_out.fmt.pix_mp.height = h;
+    f_out.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUYV;
+    f_out.fmt.pix_mp.num_planes = 1;
+    f_out.fmt.pix_mp.plane_fmt[0].bytesperline = w * 2;
+    f_out.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)(w * h * 2);
+    if (ioctl(c->vfd, VIDIOC_S_FMT, &f_out) < 0) return -2;
+    c->in_size = f_out.fmt.pix_mp.plane_fmt[0].sizeimage ? f_out.fmt.pix_mp.plane_fmt[0].sizeimage : (size_t)w * h * 2;
+
+    struct v4l2_format f_cap = {0};
+    f_cap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    f_cap.fmt.pix_mp.width = w;
+    f_cap.fmt.pix_mp.height = h;
+    f_cap.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_JPEG;
+    f_cap.fmt.pix_mp.num_planes = 1;
+    f_cap.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)(w * h * 2);
+    if (ioctl(c->vfd, VIDIOC_S_FMT, &f_cap) < 0) return -3;
+    c->cap_size = f_cap.fmt.pix_mp.plane_fmt[0].sizeimage ? f_cap.fmt.pix_mp.plane_fmt[0].sizeimage : (size_t)w * h * 2;
+
+    if (ion_alloc_buf(c->ion_fd, c->in_size, &c->in_h, &c->in_fd, &c->in_map) < 0) return -4;
+    if (ion_alloc_buf(c->ion_fd, c->cap_size, &c->cap_h, &c->cap_fd, &c->cap_map) < 0) return -5;
+
+    struct v4l2_requestbuffers req_o = { .count = 1, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_DMABUF };
+    struct v4l2_requestbuffers req_c = { .count = 1, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .memory = V4L2_MEMORY_DMABUF };
+    if (ioctl(c->vfd, VIDIOC_REQBUFS, &req_o) < 0) return -6;
+    if (ioctl(c->vfd, VIDIOC_REQBUFS, &req_c) < 0) return -7;
+
+    int t_o = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, t_c = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    if (ioctl(c->vfd, VIDIOC_STREAMON, &t_o) < 0) return -8;
+    if (ioctl(c->vfd, VIDIOC_STREAMON, &t_c) < 0) return -9;
+    return 0;
+}
+
+static ssize_t hwjpeg_encode(hwjpeg_ctx *c, const uint32_t *bgrx, int w, int h) {
+    bgrx_to_yuyv_neon((const uint8_t *)bgrx, c->in_map, w, h);
+
+    struct v4l2_plane po = {0}, pc = {0};
+    po.m.fd = c->in_fd; po.length = (uint32_t)c->in_size; po.bytesused = (uint32_t)(w * h * 2);
+    pc.m.fd = c->cap_fd; pc.length = (uint32_t)c->cap_size;
+
+    struct v4l2_buffer bo = {0}, bc = {0};
+    bo.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; bo.memory = V4L2_MEMORY_DMABUF; bo.index = 0; bo.length = 1; bo.m.planes = &po;
+    bc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; bc.memory = V4L2_MEMORY_DMABUF; bc.index = 0; bc.length = 1; bc.m.planes = &pc;
+
+    if (ioctl(c->vfd, VIDIOC_QBUF, &bc) < 0) return -1;
+    if (ioctl(c->vfd, VIDIOC_QBUF, &bo) < 0) return -2;
+
+    if (ioctl(c->vfd, VIDIOC_DQBUF, &bc) < 0) return -3;
+    if (ioctl(c->vfd, VIDIOC_DQBUF, &bo) < 0) return -4;
+    return (ssize_t)bc.m.planes[0].bytesused;
+}
+
+static void *accept_thread(void *arg) {
+    (void)arg;
+    unlink(XFCE_SOCK);
+    g_srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un sa = {0};
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, XFCE_SOCK, sizeof(sa.sun_path) - 1);
+    if (bind(g_srv_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) return NULL;
+    chmod(XFCE_SOCK, 0666);
+    listen(g_srv_fd, 4);
+
+    while (g_running) {
+        int cfd = accept(g_srv_fd, NULL, NULL);
+        if (cfd < 0) { usleep(100000); continue; }
+        pthread_mutex_lock(&g_cli_mu);
+        if (g_cli_fd >= 0) close(g_cli_fd);
+        g_cli_fd = cfd;
+        pthread_mutex_unlock(&g_cli_mu);
+    }
+    return NULL;
+}
+
+static void send_frame(const uint8_t *jpg, uint32_t len) {
+    int fd_shm = open(XFCE_SHM_JPG ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_shm >= 0) {
+        ssize_t w = write(fd_shm, jpg, len);
+        (void)w;
+        close(fd_shm);
+        rename(XFCE_SHM_JPG ".tmp", XFCE_SHM_JPG);
+    }
+    pthread_mutex_lock(&g_cli_mu);
+    if (g_cli_fd >= 0) {
+        uint8_t hdr[4] = { len & 0xff, (len >> 8) & 0xff, (len >> 16) & 0xff, (len >> 24) & 0xff };
+        if (send(g_cli_fd, hdr, 4, MSG_NOSIGNAL) != 4 ||
+            send(g_cli_fd, jpg, len, MSG_NOSIGNAL) != (ssize_t)len) {
+            close(g_cli_fd);
+            g_cli_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&g_cli_mu);
+}
+
+static void *enc_thread(void *arg) {
+    (void)arg;
+    hwjpeg_ctx ctx;
+    if (hwjpeg_init(&ctx, g_xv_w, g_xv_h) < 0) {
+        fprintf(stderr, "fb_xfce_bridge: /dev/video4 hwjpeg_init failed\n");
+        return NULL;
+    }
+    uint32_t *local = malloc((size_t)g_xv_w * g_xv_h * 4);
+    while (g_running) {
+        pthread_mutex_lock(&g_enc_mu);
+        while (g_running && !g_enc_ready) pthread_cond_wait(&g_enc_cv, &g_enc_mu);
+        if (!g_running) { pthread_mutex_unlock(&g_enc_mu); break; }
+        memcpy(local, g_enc_buf, (size_t)g_xv_w * g_xv_h * 4);
+        g_enc_ready = 0;
+        pthread_mutex_unlock(&g_enc_mu);
+
+        ssize_t jsz = hwjpeg_encode(&ctx, local, g_xv_w, g_xv_h);
+        if (jsz > 0) send_frame(ctx.cap_map, (uint32_t)jsz);
+    }
+    free(local);
+    return NULL;
+}
+
+static void on_sig(int s) { (void)s; g_running = 0; pthread_cond_broadcast(&g_enc_cv); }
 
 static uint32_t read_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
@@ -195,10 +431,9 @@ static uint32_t read_be32(const uint8_t *p) {
 
 int main(int argc, char **argv) {
     const char *disp = argc > 1 ? argv[1] : ":0";
-    if (argc > 2 && strcmp(argv[2], "portrait") == 0) g_landscape = 0;
-
     signal(SIGTERM, on_sig);
     signal(SIGINT, on_sig);
+    signal(SIGPIPE, SIG_IGN);
 
     int xfd = -1;
     for (int i = 0; i < 60 && g_running; i++) {
@@ -214,11 +449,10 @@ int main(int argc, char **argv) {
     if (xmap == MAP_FAILED) { perror("mmap xwd"); return 2; }
 
     uint32_t hdr_sz = read_be32(xmap + 0);
-    uint32_t xv_w = read_be32(xmap + 16);
-    uint32_t xv_h = read_be32(xmap + 20);
+    g_xv_w = (int)read_be32(xmap + 16);
+    g_xv_h = (int)read_be32(xmap + 20);
     uint32_t ncolors = read_be32(xmap + 76);
-    if (xv_w == FB_W && xv_h == FB_H) g_landscape = 0;
-    else if (xv_w == FB_H && xv_h == FB_W) g_landscape = 1;
+    g_landscape = (g_xv_w == FB_H && g_xv_h == FB_W) ? 1 : 0;
 
     size_t pix_off = hdr_sz + ncolors * 12;
     const uint32_t *src = (const uint32_t *)(xmap + pix_off);
@@ -228,62 +462,73 @@ int main(int argc, char **argv) {
 
     size_t fb_bytes = (size_t)FB_STRIDE_PX * FB_H * 4;
     uint32_t *fb_map = mmap(NULL, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
-    uint32_t *prev = calloc(FB_W * FB_H, 4);
+    uint32_t *prev = calloc((size_t)FB_W * FB_H, 4);
+    g_enc_buf = malloc((size_t)g_xv_w * g_xv_h * 4);
 
     struct fb_var_screeninfo vinfo;
     ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
 
     set_screen(1);
 
-    pthread_t th_pwr, th_fifo, th_tch;
+    pthread_t th_pwr, th_fifo, th_tch, th_acc, th_enc;
     pthread_create(&th_pwr, NULL, power_thread, NULL);
     pthread_create(&th_fifo, NULL, fifo_thread, NULL);
     pthread_create(&th_tch, NULL, touch_thread, (void *)disp);
+    pthread_create(&th_acc, NULL, accept_thread, NULL);
+    pthread_create(&th_enc, NULL, enc_thread, NULL);
 
+    uint64_t last_enc_ms = 0;
     while (g_running) {
-        if (g_screen_on && fb_map != MAP_FAILED) {
-            if (!g_landscape) {
-                int dirty = 0;
-                for (int y = 0; y < FB_H; y++) {
-                    const uint32_t *srow = src + y * FB_W;
-                    uint32_t *prow = prev + y * FB_W;
-                    if (memcmp(srow, prow, FB_W * 4) != 0) {
-                        memcpy(prow, srow, FB_W * 4);
+        int changed = (memcmp(src, prev, (size_t)FB_W * FB_H * 4) != 0);
+        if (changed) {
+            memcpy(prev, src, (size_t)FB_W * FB_H * 4);
+
+            /* Push to phone /dev/fb0 only when screen is on */
+            if (g_screen_on && fb_map != MAP_FAILED) {
+                if (!g_landscape) {
+                    for (int y = 0; y < FB_H; y++) {
+                        const uint32_t *srow = prev + y * FB_W;
                         uint32_t *drow = fb_map + y * FB_STRIDE_PX;
                         for (int x = 0; x < FB_W; x++) {
                             uint32_t p = srow[x];
                             drow[x] = (p & 0x0000FF00U) | ((p & 0xFFU) << 16) | ((p >> 16) & 0xFFU) | 0xFF000000U;
                         }
-                        dirty = 1;
                     }
-                }
-                if (dirty) {
-                    vinfo.xoffset = 0; vinfo.yoffset = 0;
-                    ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
-                }
-            } else {
-                /* Landscape 2400x1080 -> physical 1080x2400 rotated 90 deg CCW */
-                if (memcmp(src, prev, (size_t)FB_W * FB_H * 4) != 0) {
-                    memcpy(prev, src, (size_t)FB_W * FB_H * 4);
+                } else {
                     for (int y_fb = 0; y_fb < FB_H; y_fb++) {
                         int vx = (FB_H - 1) - y_fb;
                         uint32_t *drow = fb_map + y_fb * FB_STRIDE_PX;
-                        const uint32_t *scol = src + vx;
+                        const uint32_t *scol = prev + vx;
                         for (int x_fb = 0; x_fb < FB_W; x_fb++) {
                             uint32_t p = scol[x_fb * FB_H];
                             drow[x_fb] = (p & 0x0000FF00U) | ((p & 0xFFU) << 16) | ((p >> 16) & 0xFFU) | 0xFF000000U;
                         }
                     }
-                    vinfo.xoffset = 0; vinfo.yoffset = 0;
-                    ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
                 }
+                vinfo.xoffset = 0; vinfo.yoffset = 0;
+                ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
+            }
+
+            /* Feed /dev/video4 HW-JPEG stream when browser client connected (or every 500ms for /frame.jpg) */
+            uint64_t t = now_ms();
+            int has_cli = (g_cli_fd >= 0);
+            if ((has_cli && t - last_enc_ms >= 25) || (t - last_enc_ms >= 500)) {
+                last_enc_ms = t;
+                pthread_mutex_lock(&g_enc_mu);
+                memcpy(g_enc_buf, prev, (size_t)g_xv_w * g_xv_h * 4);
+                g_enc_ready = 1;
+                pthread_cond_signal(&g_enc_cv);
+                pthread_mutex_unlock(&g_enc_mu);
             }
         }
-        usleep(33000);
+        usleep(20000);
     }
 
     set_screen(0);
+    if (g_srv_fd >= 0) close(g_srv_fd);
+    unlink(XFCE_SOCK);
     free(prev);
+    free(g_enc_buf);
     munmap(xmap, st.st_size);
     if (fb_map != MAP_FAILED) munmap(fb_map, fb_bytes);
     close(fbfd);
