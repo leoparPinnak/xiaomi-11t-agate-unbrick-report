@@ -41,6 +41,25 @@ _dpy = None
 _scratch_kc = None
 
 
+_TR_SLOTS = [
+    (230, 0x01ba, 0x01aa),  # ş Ş
+    (231, 0x02bb, 0x02ab),  # ğ Ğ
+    (232, 0x00fc, 0x00dc),  # ü Ü
+    (233, 0x02b9, 0x02a9),  # ı İ
+    (234, 0x00f6, 0x00d6),  # ö Ö
+    (235, 0x00e7, 0x00c7),  # ç Ç
+]
+
+TR_KEYCODES = {
+    "ş": (230, False), "Ş": (230, True),
+    "ğ": (231, False), "Ğ": (231, True),
+    "ü": (232, False), "Ü": (232, True),
+    "ı": (233, False), "İ": (233, True),
+    "ö": (234, False), "Ö": (234, True),
+    "ç": (235, False), "Ç": (235, True),
+}
+
+
 def get_dpy():
     global _dpy, _scratch_kc
     if not _dpy:
@@ -49,7 +68,12 @@ def get_dpy():
             mn = ctypes.c_int()
             mx = ctypes.c_int()
             _x11.XDisplayKeycodes(_dpy, ctypes.byref(mn), ctypes.byref(mx))
-            _scratch_kc = mx.value  # highest valid keycode slot for dynamic Unicode keysyms
+            _scratch_kc = mx.value
+            for kc, lo, hi in _TR_SLOTS:
+                if mn.value <= kc <= mx.value:
+                    arr = (ctypes.c_ulong * 2)(lo, hi)
+                    _x11.XChangeKeyboardMapping(_dpy, kc, 2, arr, 1)
+            _x11.XSync(_dpy, 0)
     return _dpy
 
 
@@ -196,19 +220,9 @@ SPECIAL_KEYS = {
 }
 
 
-def press_keysym_raw(d, ks, shift=False, ctrl=False, alt=False, meta=False):
-    kc = _x11.XKeysymToKeycode(d, ks)
-    temp_mapped = False
-    if not kc and _scratch_kc:
-        # Dynamically map Unicode keysym onto scratch keycode (works for Turkish/UTF-8)
-        arr = (ctypes.c_ulong * 1)(ks)
-        _x11.XChangeKeyboardMapping(d, _scratch_kc, 1, arr, 1)
-        _x11.XSync(d, 0)
-        kc = _scratch_kc
-        temp_mapped = True
+def press_keycode_raw(d, kc, shift=False, ctrl=False, alt=False, meta=False):
     if not kc:
         return
-
     mods = []
     if ctrl:
         mods.append(_x11.XKeysymToKeycode(d, 0xFFE3))  # Control_L
@@ -228,13 +242,28 @@ def press_keysym_raw(d, ks, shift=False, ctrl=False, alt=False, meta=False):
         if mk:
             _xtst.XTestFakeKeyEvent(d, mk, 0, 0)
     _x11.XFlush(d)
+
+
+def press_keysym_raw(d, ks, shift=False, ctrl=False, alt=False, meta=False):
+    kc = _x11.XKeysymToKeycode(d, ks)
+    temp_mapped = False
+    if not kc and _scratch_kc:
+        arr = (ctypes.c_ulong * 1)(ks)
+        _x11.XChangeKeyboardMapping(d, _scratch_kc, 1, arr, 1)
+        _x11.XSync(d, 0)
+        kc = _scratch_kc
+        temp_mapped = True
+    press_keycode_raw(d, kc, shift=shift, ctrl=ctrl, alt=alt, meta=meta)
     if temp_mapped:
         _x11.XSync(d, 0)
 
 
 def send_text_unicode(d, text):
     for ch in text:
-        if ch in CHAR_KEYSYMS:
+        if ch in TR_KEYCODES:
+            kc, sh = TR_KEYCODES[ch]
+            press_keycode_raw(d, kc, shift=sh)
+        elif ch in CHAR_KEYSYMS:
             ks_name, sh = CHAR_KEYSYMS[ch]
             ks = _x11.XStringToKeysym(ks_name.encode())
             if ks:
