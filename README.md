@@ -5,7 +5,7 @@
 **Depolama & RAM:** 128 GB UFS (`SAMSUNG KLUDG4UHDC-B0E1` — `LU0: 4 MB`, `LU1: 4 MB`, `LU2: 128 GB`) + 4 GB / LPDDR4X DRAM (`0x40000000`)  
 **Güvenlik Kilidi (BROM):** `SecCFG: SBC + SLA + DAA` (`Target config: 0xe7`, `Mem read/write auth: True`, `Cmd 0xC8 blocked: True`)  
 **Tarih Aralığı:** 12 – 14 Kasım 2026  
-**Sonuç:** Tamamen ölü / siyah ekran (`Hard-Brick`, sadece BROM) durumundan ücretli yetkili hesap/box olmadan kurtarıldı; önce Android 12 `V13.0.2.0.SKWMIXM` ayağa kaldırıldı, ardından ENG ROM + Modem META analizleri tamamlandı, **Android 11 Stok MIUI `V12.5.9.0.RKWMIXM`** BROM üzerinden kuruldu ve `fastboot oem cdms` ile kilitlenen bootloader **Mi Hesabı veya bekleme süresi olmadan BROM'dan yeniden açıldı (`unlocked`)**.
+**Sonuç:** Tamamen ölü / siyah ekran (`Hard-Brick`, sadece BROM) durumundan ücretli yetkili hesap/box olmadan kurtarıldı; Android 12 `V13.0.2.0.SKWMIXM` ve Android 11 `V12.5.9.0.RKWMIXM` kuruldu, `oem cdms` ile kilitlenen bootloader BROM'dan yeniden açıldı, **Magisk 31.1 root** kuruldu, ardından Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`) Linux sunucusu** (`Wi-Fi` + `USB RNDIS` + `%60–%70 pil şarj koruması` + AMOLED ekran karartma) çalıştırıldı ve **bootloader açık şekilde `V12.5.9.0` / `V13.0.2.0` geri dönüş yedekleri/betikleri** doğrulandı.
 
 ---
 
@@ -137,64 +137,105 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - `system_a` (11/11 parça), `vendor_a` (8/8 parça), `product_a` (7/7 parça), `system_ext_a`
    - *(Not: `product_a` yazımı sırasında `fastbootd` ekranı OLED koruma nedeniyle kendini kararttı; USB bağlantısı kesilmeden arka planda yazma tamamlandı.)*
 5. `fastboot erase userdata` + `fastboot erase metadata` + `fastboot reboot` (`01:51:07`) çalıştırıldı.
-6. **SonuÃ§:** Cihaz Android/MIUI masaÃ¼stÃ¼ne sorunsuz aÃ§Ä±ldÄ± (`"cihaz geldi"`), Windows tarafÄ±ndan **`Xiaomi 11T` (`USB\VID_2717&PID_FF40`, WPD/MTP)** olarak tanÄ±ndÄ±.
+6. **Sonuç:** Cihaz Android/MIUI masaüstüne sorunsuz açıldı (`"cihaz geldi"`), Windows tarafından **`Xiaomi 11T` (`USB\VID_2717&PID_FF40`, WPD/MTP)** olarak tanındı.
 
-### AdÄ±m 6: Android 11 Stok `V12.5.9.0.RKWMIXM` GeÃ§iÅŸi ve `oem cdms` Kilitlenme OlayÄ± (14 KasÄ±m, 03:52 â€“ 04:03)
-1. Ã–nceki stok geri yÃ¼kleme (`restore_full_stock.py`, `03:45 â€“ 03:51`) sonrasÄ±nda cihaz `unlocked: yes` durumunda doÄŸrulandÄ± (`fb_precheck.log`, `03:56:49`).
-2. `dl_v1259.py` ile 8 parÃ§alÄ± paralel indirme kullanÄ±larak resmi **Android 11 `agate_global_images_V12.5.9.0.RKWMIXM_20211214.0000.00_11.0_global`** (`5,909,994,348 B`) indirildi ve Ã§Ä±karÄ±ldÄ±.
-3. `flash_v1259.py` ile Fastboot Ã¼zerinden tÃ¼m `V12.5.9.0` imajlarÄ± (`preloader_agate.bin`, `vbmeta*`, `md1img`, `lk`, `boot`, `dtbo`, `tee`, `mitee`, `super`, `rescue`, `cust`, `userdata`) sÄ±fÄ±r hatayla yazdÄ±rÄ±ldÄ± (`03:57:09 â€“ 04:02:48`).
-4. **Kritik Olay:** BetiÄŸin son adÄ±mÄ±nda yer alan `fastboot oem cdms` komutu Ã§alÄ±ÅŸtÄ±ÄŸÄ± anda Xiaomi'nin `V12.5.9.0 lk.img` iÃ§indeki MI Lock mekanizmasÄ± tetiklendi ve bootloader kilitlendi (`unlocked: no`, `lks = 1`, `unlock_ability = 0`).
+### Adım 6: Android 11 Stok `V12.5.9.0.RKWMIXM` GeçiÅŸi ve `oem cdms` Kilitlenme Olayı (14 Kasım, 03:52 â€“ 04:03)
+1. Ã–nceki stok geri yükleme (`restore_full_stock.py`, `03:45 â€“ 03:51`) sonrasında cihaz `unlocked: yes` durumunda doÄŸrulandı (`fb_precheck.log`, `03:56:49`).
+2. `dl_v1259.py` ile 8 parçalı paralel indirme kullanılarak resmi **Android 11 `agate_global_images_V12.5.9.0.RKWMIXM_20211214.0000.00_11.0_global`** (`5,909,994,348 B`) indirildi ve çıkarıldı.
+3. `flash_v1259.py` ile Fastboot üzerinden tüm `V12.5.9.0` imajları (`preloader_agate.bin`, `vbmeta*`, `md1img`, `lk`, `boot`, `dtbo`, `tee`, `mitee`, `super`, `rescue`, `cust`, `userdata`) sıfır hatayla yazdırıldı (`03:57:09 â€“ 04:02:48`).
+4. **Kritik Olay:** BetiÄŸin son adımında yer alan `fastboot oem cdms` komutu çalÄ±ÅŸtÄ±ÄŸı anda Xiaomi'nin `V12.5.9.0 lk.img` içindeki MI Lock mekanizması tetiklendi ve bootloader kilitlendi (`unlocked: no`, `lks = 1`, `unlock_ability = 0`).
 
-### AdÄ±m 7: ENG ROM Ãœzerinde Modem META (`COM9`) Kurulumu ve NVRAM KalÄ±cÄ±lÄ±k SÄ±nÄ±rÄ±nÄ±n Tespiti (04:07 â€“ 06:05)
-1. Android 11 `V12.5.9.0` Preloader (`agate-r-stable-build-normal`, `20211214-102739`) Ã¼zerine Android 11 ENG ROM (`agate-r-factory`, `20210918`) yÃ¼klendiÄŸinde cihaz ilk kez ENG ROM olarak baÅŸarÄ±yla aÃ§Ä±ldÄ± (Ã¶nceki Android 12 Preloader uyumsuzluÄŸu bÃ¶ylece doÄŸrulandÄ±).
-2. **Modem META (`v10.2340.0.5`, `META.exe` â†’ `MetaGUI.exe`) baÄŸlantÄ± sorunlarÄ± ve kalÄ±cÄ± Ã§Ã¶zÃ¼mleri:**
-   - **Auto Connection 120 sn zaman aÅŸÄ±mÄ±:** `MF_setup.txt` iÃ§indeki `Kernel com port filter`, `VID_0E8D&PID_2029&MI_02` arayÃ¼zÃ¼nÃ¼ iÃ§ermiyordu (yalnÄ±zca `META com port filter` altÄ±nda tanÄ±mlÄ±ydÄ±). **Ã‡Ã¶zÃ¼m:** `More... â†’ Android Test Mode`, `Channel Type: USB` ve `META Channel: COM9` aÃ§Ä±kÃ§a seÃ§ildi.
-   - **7 sn sonra `COM9` kopmasÄ± (`LastErrorCode:995 ERROR_OPERATION_ABORTED â†’ 22`) ve 4.07 GB hata gÃ¼nlÃ¼ÄŸÃ¼ (`META_DLL.log`):** Windows `usbser.sys` + **USB SeÃ§meli AskÄ±ya Alma (Selective Suspend)** portun 7 saniyede askÄ±ya alÄ±nmasÄ±na yol aÃ§Ä±yordu. **Ã‡Ã¶zÃ¼m:** `powercfg /SETACVALUEINDEX ... 48e6b7a6-... 0` ve `MSPower_DeviceEnable` kapatÄ±ldÄ±, 4 GB hata logu temizlendi.
-   - Bu dÃ¼zeltmeler sonrasÄ±nda ENG modem DB (`C:\mtk\db_eng\md1_mddbmeta` / `md1_mddbmetaodb`) yÃ¼klendi; `Read` (0.26 s), `Write` (0.28 s) ve geri okuma (`isAllSuccess: true`) baÅŸarÄ±yla tamamlandÄ±.
-3. **KalÄ±cÄ±lÄ±k Bulgusu:** Yeniden baÅŸlatma sonrasÄ±nda orijinal NVRAM deÄŸerlerinin geri dÃ¶ndÃ¼ÄŸÃ¼ gÃ¶rÃ¼ldÃ¼. Ä°ncelemede:
-   - `META_NVRAM_Factory_Backup_r ... is not implemented yet` nedeniyle ATM modundaki yazÄ±mÄ±n yalnÄ±zca modem RAM'ini gÃ¼ncellediÄŸi,
-   - `/mnt/vendor/nvdata/md/NVRAM/NVD_IMEI/LD0B_001` (384 B, `NVRAM_EF_IMEI_IMEISV_LID`) dosyasÄ±nÄ±n deÄŸiÅŸmediÄŸi (`mtime: 2021-09-18`) ve `Microtrust teei` + `Soter RPMB` korumasÄ±nÄ±n ATM Ã¼zerinden flash kalÄ±cÄ±lÄ±ÄŸÄ±nÄ± engellediÄŸi doÄŸrulandÄ±.
+### Adım 7: ENG ROM Ãœzerinde Modem META (`COM9`) Kurulumu ve NVRAM Kalıcılık Sınırının Tespiti (04:07 â€“ 06:05)
+1. Android 11 `V12.5.9.0` Preloader (`agate-r-stable-build-normal`, `20211214-102739`) üzerine Android 11 ENG ROM (`agate-r-factory`, `20210918`) yüklendiÄŸinde cihaz ilk kez ENG ROM olarak baÅŸarıyla açıldı (önceki Android 12 Preloader uyumsuzluÄŸu böylece doÄŸrulandı).
+2. **Modem META (`v10.2340.0.5`, `META.exe` â†’ `MetaGUI.exe`) baÄŸlantı sorunları ve kalıcı çözümleri:**
+   - **Auto Connection 120 sn zaman aÅŸımı:** `MF_setup.txt` içindeki `Kernel com port filter`, `VID_0E8D&PID_2029&MI_02` arayüzünü içermiyordu (yalnızca `META com port filter` altında tanımlıydı). **Ã‡özüm:** `More... â†’ Android Test Mode`, `Channel Type: USB` ve `META Channel: COM9` açıkça seçildi.
+   - **7 sn sonra `COM9` kopması (`LastErrorCode:995 ERROR_OPERATION_ABORTED â†’ 22`) ve 4.07 GB hata günlÃ¼ÄŸü (`META_DLL.log`):** Windows `usbser.sys` + **USB Seçmeli Askıya Alma (Selective Suspend)** portun 7 saniyede askıya alınmasına yol açıyordu. **Ã‡özüm:** `powercfg /SETACVALUEINDEX ... 48e6b7a6-... 0` ve `MSPower_DeviceEnable` kapatıldı, 4 GB hata logu temizlendi.
+   - Bu düzeltmeler sonrasında ENG modem DB (`C:\mtk\db_eng\md1_mddbmeta` / `md1_mddbmetaodb`) yüklendi; `Read` (0.26 s), `Write` (0.28 s) ve geri okuma (`isAllSuccess: true`) baÅŸarıyla tamamlandı.
+3. **Kalıcılık Bulgusu:** Yeniden baÅŸlatma sonrasında orijinal NVRAM deÄŸerlerinin geri döndÃ¼ÄŸü görüldü. İncelemede:
+   - `META_NVRAM_Factory_Backup_r ... is not implemented yet` nedeniyle ATM modundaki yazımın yalnızca modem RAM'ini güncellediÄŸi,
+   - `/mnt/vendor/nvdata/md/NVRAM/NVD_IMEI/LD0B_001` (384 B, `NVRAM_EF_IMEI_IMEISV_LID`) dosyasının deÄŸiÅŸmediÄŸi (`mtime: 2021-09-18`) ve `Microtrust teei` + `Soter RPMB` korumasının ATM üzerinden flash kalıcılÄ±ÄŸını engellediÄŸi doÄŸrulandı.
 
-### AdÄ±m 8: BROM Ãœzerinden Temiz Stok Android 11 `V12.5.9.0.RKWMIXM` Kurulumu (06:20 â€“ 06:50)
-1. `mtkclient` iÃ§indeki `writeflash()` fonksiyonunun Android sparse imajlarÄ± aÃ§madan ham kopyaladÄ±ÄŸÄ± (`xflash_lib.py`) dikkate alÄ±narak `V12.5.9.0` sparse imajlarÄ± Python ile RAW'a aÃ§Ä±ldÄ± ve trailing boÅŸ bloklarÄ± kÄ±rpÄ±ldÄ± (`super_raw.img`: `6,622,248,960 B`; `0x1000` ve `0x3000` LP metadata imzalarÄ± doÄŸrulandÄ±).
-2. `v1259_multi_cmd.txt` ve `flash_eng_cached.py` ile tek BROM oturumunda 24 partisyon + `super_raw.img` + `userdata/metadata/frp` format sÄ±fÄ±r hatayla yazÄ±ldÄ± (`flash_v1259_brom.log`).
-3. Cihaz stok MIUI 12.5 (`RP1A.200720.011`, baseband `MOLY.NR15.R3.TC8.PR2.SP.V1.P78`) masaÃ¼stÃ¼ne sorunsuz aÃ§Ä±ldÄ± (`OEM kilit aÃ§ma = aÃ§Ä±k`).
+### Adım 8: BROM Ãœzerinden Temiz Stok Android 11 `V12.5.9.0.RKWMIXM` Kurulumu (06:20 â€“ 06:50)
+1. `mtkclient` içindeki `writeflash()` fonksiyonunun Android sparse imajları açmadan ham kopyaladÄ±ÄŸı (`xflash_lib.py`) dikkate alınarak `V12.5.9.0` sparse imajları Python ile RAW'a açıldı ve trailing boÅŸ blokları kırpıldı (`super_raw.img`: `6,622,248,960 B`; `0x1000` ve `0x3000` LP metadata imzaları doÄŸrulandı).
+2. `v1259_multi_cmd.txt` ve `flash_eng_cached.py` ile tek BROM oturumunda 24 partisyon + `super_raw.img` + `userdata/metadata/frp` format sıfır hatayla yazıldı (`flash_v1259_brom.log`).
+3. Cihaz stok MIUI 12.5 (`RP1A.200720.011`, baseband `MOLY.NR15.R3.TC8.PR2.SP.V1.P78`) masaüstüne sorunsuz açıldı (`OEM kilit açma = açık`).
 
-### AdÄ±m 9: Bootloader Kilit Analizi ve Mi HesabÄ± Olmadan BROM'dan Kilidin AÃ§Ä±lmasÄ±
-1. `reunlock_check.py` ile BROM'dan `SecCfgV4` (`AES128-CBC / HACC`) Ã¼zerinden `seccfg lock â†’ unlock` yapÄ±lmasÄ±na raÄŸmen `V12.5.9.0` cihazÄ± `ro.boot.flash.locked = 1` / `lks = 1` bildirmeye devam etti.
+### Adım 9: Bootloader Kilit Analizi ve Mi Hesabı Olmadan BROM'dan Kilidin Açılması
+1. `reunlock_check.py` ile BROM'dan `SecCfgV4` (`AES128-CBC / HACC`) üzerinden `seccfg lock â†’ unlock` yapılmasına raÄŸmen `V12.5.9.0` cihazı `ro.boot.flash.locked = 1` / `lks = 1` bildirmeye devam etti.
 2. **`brom_read_lockstate.py` ile BROM TeÅŸhisi:**
-   - Mevcut `seccfg` okundu ve 12 KasÄ±m tarihli orijinal **unlocked (`lock_state = 3`)** yedekle **baytÄ± baytÄ±na eÅŸleÅŸtiÄŸi** gÃ¶rÃ¼ldÃ¼.
-   - `oem_misc1` (16 MB) tarandÄ± ve yalnÄ±zca `@0x0` ofsetinde 8 baytlÄ±k **`Jz8PNRUF`** (MI Lock magic) kaydÄ± bulundu.
-3. **`lk.img` Ä°kili KarÅŸÄ±laÅŸtÄ±rmasÄ± (`V12.5.9.0` vs `V13.0.2.0`):**
-   - `V12.5.9.0 lk.img` iÃ§inde `app/mt_boot/miunlock.c` bÃ¶lÃ¼mÃ¼nde `mi_set_magic`, `mi_check_magic`, `mi_get_sig` ve `1st time run MI Lock, write magic Jz8PNRUF` kod yolunun aktif olduÄŸu (temizlense bile yeniden yazabildiÄŸi),
-   - Resmi imzalÄ± **`V13.0.2.0 lk.img`** iÃ§inde ise **`Jz8PNRUF` / `mi_get_sig` kontrolÃ¼nÃ¼n tamamen kaldÄ±rÄ±ldÄ±ÄŸÄ±**, Ã¼stelik her iki `lk.img`'nin **birebir aynÄ± Xiaomi X.509 kÃ¶k sertifikalarÄ±yla** (`fb96eeb97cc04e83` / `337dbade8ab04920`) ve aynÄ± `hdr_ver: 2` yapÄ±sÄ±yla imzalandÄ±ÄŸÄ± tespit edildi.
-4. **Kesin Ã‡Ã¶zÃ¼m (`brom_unlock_lk13.py`):**
-   - BROM'dan `oem_misc1` ilk 64 KB'Ä± sÄ±fÄ±rlandÄ± (geri okuma ile `0` non-zero bayt doÄŸrulandÄ±).
-   - `lk_a` partisyonuna resmi Xiaomi imzalÄ± `V13.0.2.0 lk.img` yazÄ±ldÄ±.
-   - **SonuÃ§:** Reset sonrasÄ± cihaz Mi HesabÄ± veya 168 saat bekleme sÃ¼resi olmadan **`unlocked`** uyarÄ±sÄ±yla aÃ§Ä±ldÄ± ve MIUI 12.5 baÅŸlatÄ±ldÄ±.
+   - Mevcut `seccfg` okundu ve 12 Kasım tarihli orijinal **unlocked (`lock_state = 3`)** yedekle **baytı baytına eÅŸleÅŸtiÄŸi** görüldü.
+   - `oem_misc1` (16 MB) tarandı ve yalnızca `@0x0` ofsetinde 8 baytlık **`Jz8PNRUF`** (MI Lock magic) kaydı bulundu.
+3. **`lk.img` İkili KarÅŸılaÅŸtırması (`V12.5.9.0` vs `V13.0.2.0`):**
+   - `V12.5.9.0 lk.img` içinde `app/mt_boot/miunlock.c` bölümünde `mi_set_magic`, `mi_check_magic`, `mi_get_sig` ve `1st time run MI Lock, write magic Jz8PNRUF` kod yolunun aktif olduÄŸu (temizlense bile yeniden yazabildiÄŸi),
+   - Resmi imzalı **`V13.0.2.0 lk.img`** içinde ise **`Jz8PNRUF` / `mi_get_sig` kontrolünün tamamen kaldırıldÄ±ÄŸı**, üstelik her iki `lk.img`'nin **birebir aynı Xiaomi X.509 kök sertifikalarıyla** (`fb96eeb97cc04e83` / `337dbade8ab04920`) ve aynı `hdr_ver: 2` yapısıyla imzalandÄ±ÄŸı tespit edildi.
+4. **Kesin Ã‡özüm (`brom_unlock_lk13.py`):**
+   - BROM'dan `oem_misc1` ilk 64 KB'ı sıfırlandı (geri okuma ile `0` non-zero bayt doÄŸrulandı).
+   - `lk_a` partisyonuna resmi Xiaomi imzalı `V13.0.2.0 lk.img` yazıldı.
+   - **Sonuç:** Reset sonrası cihaz Mi Hesabı veya 168 saat bekleme süresi olmadan **`unlocked`** uyarısıyla açıldı ve MIUI 12.5 baÅŸlatıldı.
+
+### Adım 10: Magisk 31.1 Root, Ubuntu 22.04 Chroot ve %60–%70 Pil Koruması (14 Kasım)
+1. **Magisk 31.1 Kurulumu ve `boot_patch.sh` Düzeltmesi:**
+   - `V12.5.9.0` stok `boot.img` (`KEEPVERITY=true`, `KEEPFORCEENCRYPT=true`, `PREINITDEVICE=metadata`) cihaz üzerinde `magiskboot` + `boot_patch.sh` ile yamalanırken, kaynak dosya adının `stock_boot.img` verilmesinin `boot_patch.sh` içindeki `cat $BOOTIMAGE > stock_boot.img` satırı yüzünden dosyayı 0 bayta düşürüp `mmap EINVAL` hatası verdiği tespit edildi → kaynak dosya `orig_boot.img` olarak adlandırılıp `magisk_patched_v1259_boot.img` üretildi.
+   - `fastboot flash boot_a` sonrası `/debug_ramdisk/magisk -v` (`31.1:MAGISK:D`) doğrulandı ve `Magisk.apk` kurularak `uid=0` aktif edildi.
+2. **Ubuntu 22.04.5 LTS ARM64 Kurulumu (`setup_ubuntu.sh`):**
+   - `/proc/config.gz` incelendi (`Linux 4.14.186`, `CONFIG_NAMESPACES=y`, `CONFIG_CGROUPS=y`, `CONFIG_OVERLAY_FS=y`, `CONFIG_USB_RTL8152=y`, `CONFIG_USB_CONFIGFS_RNDIS=y`; yalnızca `USER_NS`, `SYSVIPC`, `DEVTMPFS` kapalı).
+   - Android `/data` (`f2fs`) `nosuid,nodev` bayraklarıyla bağlı olduğu için 32 GB sparse `ext4` loop imajı (`/data/ubuntu.img`) oluşturuldu.
+   - Loop mount sırasında SELinux `avc: denied { read } scontext=u:r:kernel:s0 tcontext=u:object_r:system_data_root_file:s0` hatası `magiskpolicy --live "allow kernel system_data_root_file file { read write getattr open }"` ile aşıldı.
+   - `ubuntu-base-22.04.5-base-arm64.tar.gz` çıkarıldı; Android `CONFIG_ANDROID_PARANOID_NETWORK` nedeniyle `aid_inet (3003)`, `aid_net_raw (3004)`, `aid_net_admin (3005)` grupları ve `APT::Sandbox::User "root"` ayarlandı, `openssh-server` (`Port 2222`), `sudo`, `python3`, `git`, `wpasupplicant`, `isc-dhcp-client`, `busybox-static` kuruldu.
+3. **7/24 Pil Koruma Sistemi (`charge-limit.sh`):**
+   - Kernel sysfs üzerinden `/sys/class/power_supply/battery/input_suspend` doğrulandı (`1` yazıldığında `Discharging`, `0` yazıldığında `Charging`).
+   - Pil `>= %70` veya sıcaklık `>= 42.0 °C` olduğunda şarjı donanım seviyesinde kesen, `<= %60` olduğunda yeniden açan arka plan servisi (`charge-limit.sh`) + Ubuntu içi izleme komutu (`batstat`) eklendi.
+
+### Adım 11: Android'siz Saf Ubuntu 22.04 Boot, USB RNDIS ve MediaTek Wi-Fi (`conninfra`/`bt_drv`) (14 Kasım)
+1. **Şifresiz Ubuntu Root Bölümü (`super` Boş Alanı — Sıfır Veri Kaybı):**
+   - `lpdump /dev/block/by-name/super` analizinde `super` (9.13 GB) içinde aktif partisyonların `12,934,080` sektörde bittiği ve **`6,622,253,056` ofsetinden itibaren `2.33 GiB` (~2.50 GB) boş alan** bulunduğu tespit edildi.
+   - Android `userdata` (`106 GB`) ve `system_a/vendor_a` bölümlerine hiç dokunulmadan bu boş alan `ext4` (`ubuntu_native`) olarak formatlandı (`magiskpolicy` `super_block_device` izniyle) ve Ubuntu rootfs buraya taşındı.
+2. **Saf Linux `initramfs` (`build_native_boot.py` → `ubuntu_native_boot.img`):**
+   - Stok `V12.5.9.0` `kernel` + `dtb` korunarak özel statik `busybox` tabanlı `initramfs` (`/init`) paketlendi.
+   - Stok kernelde `CONFIG_DEVTMPFS` kapalı olduğu için `/init` aşamasında `tmpfs` `/dev`, temel cihaz düğümleri, `busybox mdev -s` ve `/sys/class/block/*/uevent` üzerinden dinamik `PARTNAME=super` tespiti eklendi.
+   - `configfs` üzerinden **`USB RNDIS` (`0x2717:0xFF80`, `rndis.gs4` → `musb-hdrc`, `192.168.77.1/24` + `udhcpd`)** açıldı, ardından `losetup -o 6622253056` + `switch_root /newroot /sbin/linux_init` ile doğrudan saf Ubuntu PID 1 olarak başlatıldı.
+   - *(Not: MTK `lk.img` `fastboot boot` RAM boot'u desteklemediği için `lk_crash` ile geri dönmüş, imaj `fastboot flash boot_a` ile yazıldığında tek seferde açılmıştır.)*
+3. **Android Olmadan MediaTek Wi-Fi (`wlan0`) Aşamalarının Çözülmesi:**
+   - `/vendor/lib/modules/*.ko`, `/vendor/firmware/*`, `/mnt/vendor/nvdata/APCFG/APRDEB/*` ve minimal Bionic runtime (`linker64` + 8 temel `.so`, `conninfra_loader`, `wlan_assistant`) rootfs içine alındı.
+   - İlk açılışta `CONFIG_DEVTMPFS` kapalı olduğundan `insmod` sonrası `/dev/conninfra_dev` ve `/dev/wmtWifi` düğümlerinin oluşmadığı ve `conninfra_core_pre_cal_blocking` kilidinin `bt_drv.ko` yüklenene kadar beklediği tespit edildi.
+   - **Çözüm (`linux_init`):** `conninfra.ko` → `mdev -s` → `conninfra_loader` → `bt_drv.ko` → `wmt_chrdev_wifi.ko` → `wlan_drv_gen4m.ko` → `mdev -s` → `chmod 666 /dev/null ...` → `wlan_assistant &` → `echo 1 > /dev/wmtWifi` → `wpa_supplicant` + `dhclient wlan0` sırasıyla Wi-Fi saf Linux üzerinde sıfır hatayla **`wlan0` (`192.168.2.212`)** olarak ayağa kalktı.
+4. **AMOLED Ekran Karartma & Sistem İzinleri:**
+   - Açılışta bootloader Mi logosu framebuffer'da kaldığı için `/sbin/linux_init` başına `/sys/class/leds/lcd-backlight/brightness = 0`, `/sys/class/graphics/fb0/blank = 1` ve `/dev/fb0` sıfırlaması eklendi; sistem boşta **~6.96 GB boş RAM** ile sorunsuz çalışıyor.
+
+### Adım 12: Bootloader Açık Kalacak Şekilde Tam Geri Dönüş Yedeklemesi ve Güvencesi
+- `userdata` veya `super` formatlansa dahi bootloader kilit durumu (`seccfg` = `0x03`, `oem_misc1` = temiz, `lk_a` = imzalı `V13.0.2.0 lk.img`) etkilenmez; canlı sistemden `/dev/sda` (`LU0 preloader`, 4 MB, SHA-256 doğrulamalı) dahil eksik kalan kurtarma imajları yerel yedek klasörüne (`C:\Users\met\Desktop\telefon-yedek\geri-donus\`) tamamlandı.
+- **`fastboot oem cdms` komutu içermeyen** iki geri dönüş betiği hazırlandı:
+  - [`geri_donus_v1259_fastboot.ps1`](scripts/geri_donus_v1259_fastboot.ps1): Bootloader kilidini açan `lk_a_v13_unlocked.img` korunarak 3 saniyede Android 11 `V12.5.9.0` (+ Magisk) veya `-FullRestore` ile sıfırdan tam `V12.5.9.0` kurar.
+  - [`geri_donus_v1302_fastboot.ps1`](scripts/geri_donus_v1302_fastboot.ps1): Bootloader açık şekilde Android 12 `V13.0.2.0.SKWMIXM` (+ isteğe bağlı `-WithMagisk`) kurar.
+- *(Not: Cihaza özel `nvram`, `nvdata`, `proinfo`, `seccfg`, `persist`, `protect1/2`, `otp` imajları hem dosya boyutu hem de gizlilik/IMEI güvenliği nedeniyle herkese açık GitHub reposuna konmamış, yerel `telefon-yedek\partisyonlar\` ve `geri-donus\` klasörlerinde `SHA256SUMS.txt` ile korunmuştur.)*
 
 ---
 
-## 5. Kritik Dosyalar ve AraÃ§lar Ã–zeti
+## 5. Kritik Dosyalar ve Araçlar Özeti
 
-| Dosya / AraÃ§ | GÃ¶revi |
+| Dosya / Araç | Görevi |
 |---|---|
-| `C:\Users\met\Desktop\telefon-yedek\partisyonlar\` | 11 kritik orijinal partisyonun SHA-256 doÄŸrulamalÄ± yedeÄŸi |
-| `C:\Users\met\Desktop\zadig-2.9.exe` | `USB\VID_0E8D&PID_0003` ve `VID_18D1&PID_D00D` iÃ§in HVCI uyumlu `WinUSB` kurdu |
-| `C:\mtk\flash_eng_cached.py` | `mtkclient` GPT/paket Ã¶nbelleÄŸi + `Pipe error` `clear_halt` runtime yamasÄ± |
-| `C:\mtk\simg2img.py` | Android sparse imajlarÄ± (`super.img`, `userdata.img`) RAW formata Ã§evirdi |
-| `C:\mtk\extract_stock.py` | `payload.bin` (`CrAU`) iÃ§inden stok `V13.0.2.0.SKWMIXM` partisyonlarÄ±nÄ± Ã§Ä±kardÄ± |
-| `C:\mtk\v125\dl_v1259.py` & `flash_v1259.py` | Stok Android 11 `V12.5.9.0.RKWMIXM` paketini indirdi ve Fastboot flash yÃ¶netti |
-| `C:\mtk\v125\v1259_multi_cmd.txt` | BROM Ã¼zerinden 24 partisyon + `super_raw.img` (6.62 GB) temiz kurulumunu yaptÄ± |
-| `C:\mtk\reunlock_check.py` | `SecCfgV4` (`HACC`) lock/unlock dÃ¶ngÃ¼sÃ¼nÃ¼ BROM'dan test etti |
-| `C:\mtk\v125\brom_read_lockstate.py` | `seccfg` ve 16 MB `oem_misc1` iÃ§eriÄŸini okuyup `Jz8PNRUF` bayraklarÄ±nÄ± teÅŸhis etti |
-| `C:\mtk\v125\brom_unlock_lk13.py` | `oem_misc1` temizliÄŸi + imzalÄ± `V13.0.2.0 lk.img` ile kilidi BROM'dan aÃ§tÄ± |
+| `C:\Users\met\Desktop\telefon-yedek\partisyonlar\` | 11 kritik orijinal partisyonun SHA-256 doğrulamalı yedeği |
+| `C:\Users\met\Desktop\telefon-yedek\geri-donus\` | `preloader_lu0_v125.bin`, `lk_a_v13_unlocked.img`, `seccfg_unlocked.img`, `boot_a_*` imajları ve `SHA256SUMS.txt` |
+| `C:\Users\met\Desktop\zadig-2.9.exe` | `USB\VID_0E8D&PID_0003` ve `VID_18D1&PID_D00D` için HVCI uyumlu `WinUSB` kurdu |
+| `C:\mtk\flash_eng_cached.py` | `mtkclient` GPT/paket önbelleği + `Pipe error` `clear_halt` runtime yaması |
+| `C:\mtk\simg2img.py` | Android sparse imajları (`super.img`, `userdata.img`) RAW formata çevirdi |
+| `C:\mtk\extract_stock.py` | `payload.bin` (`CrAU`) içinden stok `V13.0.2.0.SKWMIXM` partisyonlarını çıkardı |
+| `C:\mtk\v125\dl_v1259.py` & `flash_v1259.py` | Stok Android 11 `V12.5.9.0.RKWMIXM` paketini indirdi ve Fastboot flash yönetti |
+| `C:\mtk\v125\v1259_multi_cmd.txt` | BROM üzerinden 24 partisyon + `super_raw.img` (6.62 GB) temiz kurulumunu yaptı |
+| `C:\mtk\reunlock_check.py` | `SecCfgV4` (`HACC`) lock/unlock döngüsünü BROM'dan test etti |
+| `C:\mtk\v125\brom_read_lockstate.py` | `seccfg` ve 16 MB `oem_misc1` içeriğini okuyup `Jz8PNRUF` bayraklarını teşhis etti |
+| `C:\mtk\v125\brom_unlock_lk13.py` | `oem_misc1` temizliği + imzalı `V13.0.2.0 lk.img` ile kilidi BROM'dan açtı |
+| `scripts/setup_ubuntu.sh` | Android üzerinde 32 GB sparse `ext4` loop imajına Ubuntu 22.04 kurulumu |
+| `scripts/build_native_boot.py` | Stok `kernel` + `dtb` + statik `busybox` `initramfs` ile Android'siz `boot.img` üreticisi |
+| `scripts/linux_init.sh`, `charge-limit.sh`, `batstat.sh` | Saf Linux PID 1 başlatıcısı (RNDIS + MTK Wi-Fi + SSH + ekran karartma + %60–%70 şarj kesici) |
+| `scripts/geri_donus_v1259_fastboot.ps1` & `geri_donus_v1302_fastboot.ps1` | Bootloader kilitlemeden Android 11 / Android 12 geri dönüş betikleri |
 
 ---
 
-## 6. Durum Ã–zeti
+## 6. Durum Özeti
 
-- **Hard-Brick Kurtarma:** TamamlandÄ± (`V13.0.2.0` ve ardÄ±ndan Android 11 `V12.5.9.0` sÄ±fÄ±r hatayla kuruldu).
-- **Bootloader Kilidi:** `oem_misc1` (`Jz8PNRUF`) temizliÄŸi + resmi `V13.0.2.0 lk.img` ile **Mi HesabÄ± olmadan `unlocked` hale getirildi**.
-- **Veri & Kimlik GÃ¼venliÄŸi:** `nvram`, `nvdata`, `nvcfg`, `protect1`, `protect2`, `persist`, `proinfo`, `otp` korunmaya devam ediyor; Modem META'nÄ±n ATM modunda TEE/RPMB sÄ±nÄ±rÄ± nedeniyle NVRAM kalÄ±cÄ±lÄ±ÄŸÄ± saÄŸlamadÄ±ÄŸÄ± belgelendi.
-- **SÄ±radaki AdÄ±m:** Kilit aÃ§Ä±ldÄ±ÄŸÄ±na gÃ¶re `V12.5.9.0` `boot.img` dosyasÄ±nÄ±n `magisk_patch` ile yamalanÄ±p root (`Magisk`) kurulumunun tamamlanmasÄ±.
+- **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
+- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — `super` boş alanındaki 2.2 GB `ext4` bölümünden açılıyor; **USB RNDIS (`192.168.77.1:2222`)**, **Wi-Fi (`192.168.2.212:2222`)**, **%60–%70 şarj kesici** ve **AMOLED ekran karartma** aktif (~7 GB boş RAM).
+- **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak hazırlandı.
+- **Sıradaki Opsiyonel Adımlar:** `userdata` (`106 GB`) bölümünü tamamen Ubuntu diski yapma, Docker/Chromium için özel kernel derleme veya istenildiğinde tek komutla Android 11/12'ye geri dönme.
