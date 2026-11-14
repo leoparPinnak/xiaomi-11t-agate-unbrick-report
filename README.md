@@ -286,6 +286,10 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - `fb_xfce_bridge` içine **ARM64 NEON SIMD (`bgrx_to_yuyv_neon`)** + **ION `0x400` DMA-BUF** + **`/dev/video4` (`mtk-jpeg-enc`)** encoder thread eklendi; `/tmp/xfce_hwjpeg.sock` üzerinden ham JPEG karelerini yayınlar.
    - `http://192.168.2.212:8090/` arayüzü (`xfce_stream_server.py`) tarayıcıdan **tıklama, sağ tık, sürükleme, kaydırma, klavye, yatay/dikey döndürme ve ekran ışığı aç/kapat** kontrolü sağlar (`libX11` + `libXtst`).
    - `:8080` (`/dev/video3` Mali GPU WebGL/Chromium konsolu) ile `:8090` (`/dev/video4` XFCE masaüstü yayını) arasında üst çubuktaki butonlarla tek tıkla geçiş yapılabilir.
+3. **Canlı İmleç, Tutup Sürükleme, Türkçe Klavye ve `asyncio` Görev Koruması:**
+   - `fb_xfce_bridge.c` içine **`libXfixes` (`XFixesGetCursorImage`)** entegre edilerek X11 fare imleci hem telefon ekranına hem `:8090` yayınına canlı çizildi.
+   - `:8090` ve `:8080` üzerine `draggable="false"` + `pointerdown/pointermove/pointerup` + `setPointerCapture` ile gerçek tutup sürükleme; `:8090` içine `/ws/input` WebSocket kanalı, `Ctrl+A/C/V/X/Z/T/W` / `Alt+Tab` kısayol barı ve çakışmasız boş keycode slotları (`154..197`) ile tam Türkçe karakter (`ç ğ ı İ ö ş ü`) desteği eklendi.
+   - Python 3.10 Garbage Collector'ın referanssız `asyncio.create_task` soket okuyucularını iptal ederek `FPS: 0` üretmesi (`Task was destroyed but it is pending`) her iki sunucuda `_spawn()` referans setiyle kalıcı çözüldü.
 
 ---
 
