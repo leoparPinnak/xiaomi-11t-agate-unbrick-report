@@ -36,9 +36,19 @@ async def cdp_loop():
             "--no-sandbox",
             "--disable-gpu",
             "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=Translate,OptimizationHints,MediaRouter,InterestCohort",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--password-store=basic",
+            "--use-mock-keychain",
             f"--remote-debugging-port={CDP_PORT}",
             "--remote-allow-origins=*",
-            "--window-size=1280,720",
+            "--window-size=1920,1080",
             f"--user-data-dir={USER_DIR}",
             "https://www.wikipedia.org/",
         ],
@@ -69,7 +79,7 @@ async def cdp_loop():
             cdp_ws = ws
             await cdp_call("Page.enable")
             await cdp_call("Emulation.setDeviceMetricsOverride", {
-                "width": 1280, "height": 720, "deviceScaleFactor": 1, "mobile": False
+                "width": 1920, "height": 1080, "deviceScaleFactor": 1, "mobile": False
             })
             await cdp_call("Page.startScreencast", {
                 "format": "jpeg", "quality": 75, "maxWidth": 1280, "maxHeight": 720, "everyNthFrame": 1
@@ -118,7 +128,7 @@ function reload(){ send({type:'reload'}); }
 function goBack(){ send({type:'back'}); }
 function coords(e){
   const r = img.getBoundingClientRect();
-  return { x: Math.round((e.clientX - r.left) * 1280 / r.width), y: Math.round((e.clientY - r.top) * 720 / r.height) };
+  return { x: Math.round((e.clientX - r.left) * 1920 / r.width), y: Math.round((e.clientY - r.top) * 1080 / r.height) };
 }
 img.addEventListener('mousedown', e => { img.focus(); const c=coords(e); send({type:'mouse', action:'mousePressed', ...c}); });
 img.addEventListener('mouseup', e => { const c=coords(e); send({type:'mouse', action:'mouseReleased', ...c}); });
