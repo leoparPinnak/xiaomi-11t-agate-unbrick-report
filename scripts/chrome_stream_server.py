@@ -709,7 +709,7 @@ HTML = r"""<!doctype html>
 
   <div class="stage" id="stage">
     <div class="img-wrap">
-      <img id="scr" src="/frame.jpg" tabindex="0" alt="Chromium Live Stream">
+      <img id="scr" src="/frame.jpg" tabindex="0" draggable="false" alt="Chromium Live Stream">
       <div class="hud-overlay" id="hud-overlay">1920×1080 HW-JPEG · Bağlanıyor...</div>
     </div>
   </div>
@@ -981,19 +981,29 @@ function coords(e) {
     y: Math.max(0, Math.min(curH - 1, Math.round((e.clientY - r.top) * curH / r.height)))
   };
 }
+let isDragging = false;
+scr.addEventListener('dragstart', e => e.preventDefault());
 scr.addEventListener('contextmenu', e => e.preventDefault());
-scr.addEventListener('mousedown', e => {
+scr.addEventListener('pointerdown', e => {
+  e.preventDefault();
   scr.focus();
+  try { scr.setPointerCapture(e.pointerId); } catch (_) {}
+  isDragging = true;
   const btn = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
   sendCtrl({type: 'mouse', action: 'mousePressed', button: btn, ...coords(e)});
 });
-scr.addEventListener('mouseup', e => {
+function endScrPtr(e) {
+  if (!isDragging) return;
+  isDragging = false;
+  try { scr.releasePointerCapture(e.pointerId); } catch (_) {}
   const btn = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
   sendCtrl({type: 'mouse', action: 'mouseReleased', button: btn, ...coords(e)});
-});
-scr.addEventListener('mousemove', e => {
+}
+scr.addEventListener('pointerup', endScrPtr);
+scr.addEventListener('pointercancel', endScrPtr);
+scr.addEventListener('pointermove', e => {
   const now = performance.now();
-  if (now - lastMoveTs < 45) return;
+  if (now - lastMoveTs < (isDragging ? 18 : 42)) return;
   lastMoveTs = now;
   sendCtrl({type: 'mouse', action: 'mouseMoved', button: 'none', ...coords(e)});
 });

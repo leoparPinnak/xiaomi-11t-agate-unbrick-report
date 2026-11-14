@@ -36,6 +36,15 @@ struct mtk_ion_handle_data{ int handle; };
 #define ION_IOC_SHARE _IOWR('I', 4, struct mtk_ion_fd_data)
 #define ION_HEAP_MULTIMEDIA_MASK (1u << 10)
 
+/* Binary-compatible XFixesCursorImage (LP64 aarch64) */
+typedef struct {
+    short x, y;
+    unsigned short width, height;
+    unsigned short xhot, yhot;
+    unsigned long cursor_serial;
+    unsigned long *pixels;
+} my_XFixesCursorImage;
+
 static volatile int g_running = 1;
 static volatile int g_screen_on = 1;
 static int g_landscape = 1;
@@ -122,14 +131,20 @@ static void map_touch(int raw_x_px, int raw_y_px, int *out_x, int *out_y) {
     if (g_landscape) {
         int vx = (FB_H - 1) - raw_y_px;
         int vy = raw_x_px;
-        if (vx < 0) vx = 0; if (vx >= FB_H) vx = FB_H - 1;
-        if (vy < 0) vy = 0; if (vy >= FB_W) vy = FB_W - 1;
-        *out_x = vx; *out_y = vy;
+        if (vx < 0) vx = 0;
+        if (vx >= FB_H) vx = FB_H - 1;
+        if (vy < 0) vy = 0;
+        if (vy >= FB_W) vy = FB_W - 1;
+        *out_x = vx;
+        *out_y = vy;
     } else {
         int vx = raw_x_px, vy = raw_y_px;
-        if (vx < 0) vx = 0; if (vx >= FB_W) vx = FB_W - 1;
-        if (vy < 0) vy = 0; if (vy >= FB_H) vy = FB_H - 1;
-        *out_x = vx; *out_y = vy;
+        if (vx < 0) vx = 0;
+        if (vx >= FB_W) vx = FB_W - 1;
+        if (vy < 0) vy = 0;
+        if (vy >= FB_H) vy = FB_H - 1;
+        *out_x = vx;
+        *out_y = vy;
     }
 }
 
@@ -210,7 +225,37 @@ static void *touch_thread(void *arg) {
     return NULL;
 }
 
-/* NEON BGRX -> YUYV conversion (XWD 32-bit little endian = B,G,R,X) */
+/* Blend XFixes ARGB cursor onto BGRX frame buffer */
+static void overlay_cursor(uint32_t *buf, int w, int h, const my_XFixesCursorImage *ci) {
+    if (!ci || !ci->pixels || ci->width == 0 || ci->height == 0) return;
+    int ox = (int)ci->x - (int)ci->xhot;
+    int oy = (int)ci->y - (int)ci->yhot;
+    for (int cy = 0; cy < ci->height; cy++) {
+        int dy = oy + cy;
+        if (dy < 0 || dy >= h) continue;
+        for (int cx = 0; cx < ci->width; cx++) {
+            int dx = ox + cx;
+            if (dx < 0 || dx >= w) continue;
+            uint32_t c = (uint32_t)ci->pixels[cy * ci->width + cx];
+            uint32_t a = (c >> 24) & 0xffU;
+            if (a == 0) continue;
+            uint32_t *dst = &buf[dy * w + dx];
+            if (a == 255) {
+                *dst = c;
+            } else {
+                uint32_t d = *dst;
+                uint32_t ia = 255U - a;
+                uint32_t cr = (c >> 16) & 0xffU, cg = (c >> 8) & 0xffU, cb = c & 0xffU;
+                uint32_t dr = (d >> 16) & 0xffU, dg = (d >> 8) & 0xffU, db = d & 0xffU;
+                uint32_t rr = (cr * a + dr * ia) / 255U;
+                uint32_t rg = (cg * a + dg * ia) / 255U;
+                uint32_t rb = (cb * a + db * ia) / 255U;
+                *dst = (rr << 16) | (rg << 8) | rb;
+            }
+        }
+    }
+}
+
 static void bgrx_to_yuyv_neon(const uint8_t *src, uint8_t *dst, int w, int h) {
     const uint8x8_t k66  = vdup_n_u8(66);
     const uint8x8_t k129 = vdup_n_u8(129);
@@ -462,11 +507,20 @@ int main(int argc, char **argv) {
 
     size_t fb_bytes = (size_t)FB_STRIDE_PX * FB_H * 4;
     uint32_t *fb_map = mmap(NULL, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fbfd, 0);
-    uint32_t *prev = calloc((size_t)FB_W * FB_H, 4);
+    uint32_t *prev_raw = calloc((size_t)FB_W * FB_H, 4);
+    uint32_t *composed = malloc((size_t)g_xv_w * g_xv_h * 4);
     g_enc_buf = malloc((size_t)g_xv_w * g_xv_h * 4);
 
     struct fb_var_screeninfo vinfo;
     ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
+
+    /* Load X11 + XFixes to read real cursor shape & position */
+    void *hx11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
+    void *hxfix = dlopen("libXfixes.so.3", RTLD_NOW);
+    void *(*pXOpenDisplay)(const char *) = hx11 ? dlsym(hx11, "XOpenDisplay") : NULL;
+    int (*pXFree)(void *) = hx11 ? dlsym(hx11, "XFree") : NULL;
+    my_XFixesCursorImage *(*pGetCursor)(void *) = hxfix ? dlsym(hxfix, "XFixesGetCursorImage") : NULL;
+    void *cur_dpy = pXOpenDisplay ? pXOpenDisplay(disp) : NULL;
 
     set_screen(1);
 
@@ -478,16 +532,25 @@ int main(int argc, char **argv) {
     pthread_create(&th_enc, NULL, enc_thread, NULL);
 
     uint64_t last_enc_ms = 0;
-    while (g_running) {
-        int changed = (memcmp(src, prev, (size_t)FB_W * FB_H * 4) != 0);
-        if (changed) {
-            memcpy(prev, src, (size_t)FB_W * FB_H * 4);
+    int prev_cx = -999, prev_cy = -999;
+    unsigned long prev_serial = 0;
 
-            /* Push to phone /dev/fb0 only when screen is on */
+    while (g_running) {
+        int fb_changed = (memcmp(src, prev_raw, (size_t)FB_W * FB_H * 4) != 0);
+        my_XFixesCursorImage *ci = (cur_dpy && pGetCursor) ? pGetCursor(cur_dpy) : NULL;
+        int cur_changed = (ci && (ci->x != prev_cx || ci->y != prev_cy || ci->cursor_serial != prev_serial));
+
+        if (fb_changed || cur_changed) {
+            if (fb_changed) memcpy(prev_raw, src, (size_t)FB_W * FB_H * 4);
+            if (ci) { prev_cx = ci->x; prev_cy = ci->y; prev_serial = ci->cursor_serial; }
+
+            memcpy(composed, prev_raw, (size_t)g_xv_w * g_xv_h * 4);
+            if (ci) overlay_cursor(composed, g_xv_w, g_xv_h, ci);
+
             if (g_screen_on && fb_map != MAP_FAILED) {
                 if (!g_landscape) {
                     for (int y = 0; y < FB_H; y++) {
-                        const uint32_t *srow = prev + y * FB_W;
+                        const uint32_t *srow = composed + y * FB_W;
                         uint32_t *drow = fb_map + y * FB_STRIDE_PX;
                         for (int x = 0; x < FB_W; x++) {
                             uint32_t p = srow[x];
@@ -498,7 +561,7 @@ int main(int argc, char **argv) {
                     for (int y_fb = 0; y_fb < FB_H; y_fb++) {
                         int vx = (FB_H - 1) - y_fb;
                         uint32_t *drow = fb_map + y_fb * FB_STRIDE_PX;
-                        const uint32_t *scol = prev + vx;
+                        const uint32_t *scol = composed + vx;
                         for (int x_fb = 0; x_fb < FB_W; x_fb++) {
                             uint32_t p = scol[x_fb * FB_H];
                             drow[x_fb] = (p & 0x0000FF00U) | ((p & 0xFFU) << 16) | ((p >> 16) & 0xFFU) | 0xFF000000U;
@@ -509,25 +572,26 @@ int main(int argc, char **argv) {
                 ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
             }
 
-            /* Feed /dev/video4 HW-JPEG stream when browser client connected (or every 500ms for /frame.jpg) */
             uint64_t t = now_ms();
             int has_cli = (g_cli_fd >= 0);
-            if ((has_cli && t - last_enc_ms >= 25) || (t - last_enc_ms >= 500)) {
+            if ((has_cli && t - last_enc_ms >= 22) || (t - last_enc_ms >= 400)) {
                 last_enc_ms = t;
                 pthread_mutex_lock(&g_enc_mu);
-                memcpy(g_enc_buf, prev, (size_t)g_xv_w * g_xv_h * 4);
+                memcpy(g_enc_buf, composed, (size_t)g_xv_w * g_xv_h * 4);
                 g_enc_ready = 1;
                 pthread_cond_signal(&g_enc_cv);
                 pthread_mutex_unlock(&g_enc_mu);
             }
         }
-        usleep(20000);
+        if (ci && pXFree) pXFree(ci);
+        usleep(18000);
     }
 
     set_screen(0);
     if (g_srv_fd >= 0) close(g_srv_fd);
     unlink(XFCE_SOCK);
-    free(prev);
+    free(prev_raw);
+    free(composed);
     free(g_enc_buf);
     munmap(xmap, st.st_size);
     if (fb_map != MAP_FAILED) munmap(fb_map, fb_bytes);
