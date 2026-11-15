@@ -1,7 +1,8 @@
-service agate_charge_limit /system_ext/bin/sh /system_ext/bin/agate_charge_limit.sh
+service agate_charge_limit /system/bin/sh /system_ext/bin/agate_charge_limit.sh
     class late_start
     user root
     group root system
+    seclabel u:r:su:s0
     disabled
     oneshot
 

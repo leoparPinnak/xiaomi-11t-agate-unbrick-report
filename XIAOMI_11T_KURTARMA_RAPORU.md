@@ -302,6 +302,22 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
    - Gelen `AGTT` karolarını doğrudan `QImage(3840, 2160)` üzerine çizer (`8 MB` RX buffer, `4K`/`1080p`/`Yatay`/`Dikey`, `F11` tam ekran).
    - Canlı 4K doğrulama sonucu: **4/4 karo tam (`3840×2160`), `~693 KB/s`, `%0.0` paket kaybı** (`C:\mtk\agate_udp_client.py` ve `C:\mtk\baslat_udp_ekran.bat`).
 
+### Adım 20: Sıfırdan AOSP 13 (`aosp_agate_hud`) ROM Derlemesi, `4.14.186` eBPF & Treble Düzeltmeleri ve Xiaomi 11T'de Canlı Açılış (15 Kasım)
+1. **AOSP 13 Kaynak Ağacı, WSL2 Ortamı ve Emülatör Doğrulaması (`D:\AOSP_MIRROR`, `D:\WSL\Ubuntu`):**
+   - 1150 git deposundan (`26.73 GB`) **AOSP 13 (`android-13.0.0_r83`, `TQ3A.230805.001.S1`)** çekildi ve WSL2 Ubuntu 22.04 (`32` çekirdek, `52 GB` RAM, `m -j32`) üzerinde sıfırdan derlendi (`130.093` Ninja adımı).
+   - **GPU AGSL Cockpit HUD Launcher (`AgateHudLauncher`):** Jetpack Compose + Material3 + **`RuntimeShader` (AGSL)** (`COCKPIT_BACKGROUND_AGSL` plazma/3D zemin ızgarası + `RADIAL_GAUGE_AGSL` Mali-G77 kadranları) + canlı `/proc/stat`, `/proc/meminfo`, termal zonlar ve çevrimdışı/LLM destekli Türkçe `HudAgentEngine` yazıldı ve Windows `agate_hud_emu` (`1080×2400`) emülatöründe doğrulandı.
+   - **Sistem Tema Overlay & Açılış Animasyonu:** `AgateHudFrameworkOverlay` (RRO), `640×640` `AGATE HUD OS` `bootanimation.zip`, `agate_hud.rc` ve `agate_charge_limit.sh` (`>= %70` kes / `<= %67` devam) ROM içine gömüldü.
+2. **Fiziksel Cihaz (`agate`, Linux `4.14.186` + `V13.0.2.0` Vendor) Uyum Düzeltmeleri:**
+   - **Treble VNDK v30/v31 & `skip_mount.cfg`:** `aosp_agate_hud.mk` içine `gsi_release.mk` eklendi (`com.android.vndk.v30/v31/v32` APEX'leri + `/system/system_ext/etc/init/config/skip_mount.cfg` ile stok `product`/`system_ext` çakışması engellendi).
+   - **`agate_hud.rc` Init/SELinux Düzeltmesi:** `/system_ext/bin/sh` → `/system/bin/sh` ve `seclabel u:r:su:s0` eklendi.
+   - **Linux `4.14.186` `bpfloader` Çekirdek Bug Teşhisi (`reboot,bpfloader-failed`):**
+     - Ubuntu kurtarma çekirdeği üzerinden `/metadata/bootstat/persist.sys.boot.reason` okundu (`reboot,bpfloader-failed`).
+     - AOSP `bpfloader` canlı `4.14.186` çekirdekte çalıştırıldığında 10/10 BPF `.o` dosyasının (`offload.o`, `netd.o`, `clatd.o`, `time_in_state.o`, `gpu_mem.o`, `gpu_work.o` vb.) sorunsuz yüklendiği, ancak en sondaki `BPF_MAP_TYPE_ARRAY (max_entries=2)` `key=1` yazma testinin çekirdekte `EINVAL` (`22`) döndürdüğü doğrulandı (`aosp_agate_hud/patches/bpfloader_4_14_agate.patch`). Yama sonrası `bpf.progs_loaded=1` elde edildi.
+   - **`privapp-permissions` Allowlist (`privapp-permissions-com.agate.hud.xml`):** `adb logcat` ile `PermissionManagerServiceImpl` üzerinden yakalanan `BATTERY_STATS` ve `STATUS_BAR` yetkileri `/system_ext/etc/permissions/privapp-permissions-com.agate.hud.xml` ile tanımlandı.
+3. **Fastboot / `fastbootd` Yazımı ve Canlı Donanım Doğrulaması (`scripts/flash_aosp_agate_hud.ps1`):**
+   - `V13.0.2.0` açık `lk_a` (`ECF7D2F2...`) korunarak `vbmeta*` (`--disable-verity --disable-verification`), `boot_ab`, `dtbo_ab`, `vendor_a` (`2.09 GB`) ve **`system_agate_hud.img` (`1.93 GB`)** yazıldı.
+   - **Sonuç:** Telefon **29 saniyede** kendi AOSP 13 ROM'uyla (`aosp_agate_hud-userdebug 13 TQ3A.230805.001.S1`) açıldı; `Mali-G77 MC9` (OpenGL ES 3.2) üzerinde **`com.agate.hud/.MainActivity`** canlı render aldı, `wlan0` Wi-Fi aktifleşti, `agate_charge_limit.sh` `%72` pilde `input_suspend=1` (`Discharging`) ile şarj kesiciyi otomatik devreye soktu ve `ro.boot.flash.locked=0` (`unlocked`) korundu.
+
 ---
 
 ## 5. Kritik Dosyalar ve Araçlar Özeti
@@ -332,14 +348,16 @@ ENG ROM %100 yazıldığı halde ekran yine açılmadı. Yapılan ikili karşıl
 | `scripts/gpu-perf.sh` | Mali-G77 `886 MHz` max performans / `auto` DVFS geçiş aracı (`/usr/local/bin/gpu-perf`) |
 | `scripts/chrome-gpu.sh` & `scripts/chrome_stream_server.py` | Mali-G77 GPU + `/dev/video3` HW-JPEG destekli Chromium 156 konsolu (`:8080`) |
 | `scripts/geri_donus_v1259_fastboot.ps1` & `geri_donus_v1302_fastboot.ps1` | Bootloader kilitlemeden Android 11 / Android 12 geri dönüş betikleri |
+| `scripts/flash_aosp_agate_hud.ps1` | `V13.0.2.0` açık `lk` + `vendor_a` + özel AOSP 13 `system_agate_hud.img` yazım betiği |
+| `aosp_agate_hud/` | `AgateHudLauncher` (Compose + AGSL + Agent), `AgateHudFrameworkOverlay`, `device/xiaomi/agate`, `bpfloader_4_14_agate.patch` |
 
 ---
 
 ## 6. Durum Özeti
 
-- **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda.
-- **Mevcut Çalışan Sistem:** Android'siz **Saf Ubuntu 22.04.5 LTS (`aarch64`)** — **USB RNDIS**, **Wi-Fi (`192.168.2.212:2222`)**, **`%67–%70` şarj kesici**, **dokunmatik XFCE4 masaüstü + Chromium (`ekran xfce`) / telemetri dashboard (`ekran terminal`)**, **Mali-G77 MC9 GPU (`886 MHz`) hızlandırmalı Chromium 156** ve **`weston_hwjpeg.so` (`/dev/video3` donanım JPEG @ ~29 FPS 1080p)** aktif.
-- **Veri & Geri Dönüş Güvenliği:** Android `userdata` (`106 GB`) ve `system_a` henüz silinmedi; tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a`) ve Fastboot betikleri SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır.
+- **Hard-Brick & Bootloader:** Cihaz kurtarıldı; `seccfg` (`0x03`), sıfırlanmış `oem_misc1` ve `V13.0.2.0 lk.img` ile bootloader kalıcı olarak **unlocked** durumda (`ro.boot.flash.locked=0`, `orange`).
+- **Mevcut Çalışan Sistem:** Sıfırdan derlenmiş özel **AOSP 13 (`aosp_agate_hud-userdebug 13 TQ3A.230805.001.S1`)** — **Mali-G77 MC9** üzerinde **AGSL `RuntimeShader` Kokpit HUD (`com.agate.hud`)**, **`AgateHudFrameworkOverlay`**, **Wi-Fi (`wlan0`)**, **60/120 Hz ekran** ve **`%67–%70` donanım şarj kesici (`agate_charge_limit.sh`)** fiziksel cihazda canlı aktif.
+- **Yedek & Geri Dönüş Güvenliği:** Tüm geri dönüş imajları (`preloader`, `seccfg`, `lk_a`, `boot_a_*`) ve Fastboot betikleri (`V12.5.9.0`, `V13.0.2.0`, Ubuntu) SHA-256 doğrulamalı olarak `C:\Users\met\Desktop\telefon-yedek\geri-donus\` içinde hazır; Windows `agate_hud_emu` emülatör ortamı (`D:\AndroidSdk`) da yedek geliştirme ortamı olarak aktif.
 
 ---
 

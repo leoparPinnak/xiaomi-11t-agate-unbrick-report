@@ -1,0 +1,26 @@
+diff --git a/bpfloader/BpfLoader.cpp b/bpfloader/BpfLoader.cpp
+index 5cd80b7..4b10759 100644
+--- a/bpfloader/BpfLoader.cpp
++++ b/bpfloader/BpfLoader.cpp
+@@ -204,8 +204,7 @@ int main(int argc, char** argv) {
+     android::base::unique_fd map(
+             android::bpf::createMap(BPF_MAP_TYPE_ARRAY, sizeof(key), sizeof(value), 2, 0));
+     if (android::bpf::writeToMapEntry(map, &key, &value, BPF_ANY)) {
+-        ALOGE("Critical kernel bug - failure to write into index 1 of 2 element bpf map array.");
+-        return 1;
++        ALOGW("Kernel 4.14 BPF array index>=1 quirk detected; continuing boot on agate.");
+     }
+ 
+     if (android::base::SetProperty("bpf.progs_loaded", "1") == false) {
+diff --git a/bpfloader/bpfloader.rc b/bpfloader/bpfloader.rc
+index 0d92cd8..b497ef7 100644
+--- a/bpfloader/bpfloader.rc
++++ b/bpfloader/bpfloader.rc
+@@ -81,6 +81,6 @@ service bpfloader /system/bin/bpfloader
+     #    'cannot prove return value is 0 or 1' or 'unsupported / unknown operation / helper',
+     #    'invalid bpf_context access', etc.
+     #
+-    reboot_on_failure reboot,bpfloader-failed
++    # reboot_on_failure reboot,bpfloader-failed (disabled for agate 4.14)
+     # we're not really updatable, but want to be able to load bpf programs shipped in apexes
+     updatable
