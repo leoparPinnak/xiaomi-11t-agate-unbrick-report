@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Agate Automotive Cockpit / HUD Palette -->
+    <color name="system_accent1_100">#FF6DF2FF</color>
+    <color name="system_accent1_200">#FF00E5FF</color>
+    <color name="system_accent1_300">#FF00C4DE</color>
+    <color name="system_accent1_500">#FF0099B8</color>
+    <color name="system_accent1_600">#FF007B94</color>
+
+    <color name="system_accent2_100">#FFFFC766</color>
+    <color name="system_accent2_200">#FFFF9F1C</color>
+    <color name="system_accent2_300">#FFE08200</color>
+
+    <color name="system_neutral1_800">#FF0E1726</color>
+    <color name="system_neutral1_900">#FF080E18</color>
+    <color name="system_neutral1_1000">#FF04070D</color>
+
+    <color name="accent_device_default_dark">#FF00E5FF</color>
+    <color name="accent_primary_device_default">#FF00E5FF</color>
+    <color name="accent_primary_variant_dark_device_default">#FF00B8D4</color>
+
+    <!-- Corner radii for crisp cockpit chamfered look -->
+    <dimen name="config_dialogCornerRadius">16dp</dimen>
+    <dimen name="config_bottomDialogCornerRadius">20dp</dimen>
+</resources>

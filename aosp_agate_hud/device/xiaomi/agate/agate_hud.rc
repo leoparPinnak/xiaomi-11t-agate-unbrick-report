@@ -1,0 +1,11 @@
+service agate_charge_limit /system_ext/bin/sh /system_ext/bin/agate_charge_limit.sh
+    class late_start
+    user root
+    group root system
+    disabled
+    oneshot
+
+on property:sys.boot_completed=1
+    chmod 0664 /sys/class/power_supply/battery/input_suspend
+    chown system system /sys/class/power_supply/battery/input_suspend
+    start agate_charge_limit
